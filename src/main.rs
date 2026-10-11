@@ -12,9 +12,9 @@
 //!   -v .. -vvvv                 increasingly detailed logs (see --help)
 //!   --qlog DIR                  one qlog file per connection, view in https://qvis.quictools.info
 //!   SSLKEYLOGFILE=keys.txt      TLS secrets, lets Wireshark decrypt captured QUIC packets
+//!   --merge-qlog OUT A B        merge client + server traces into one file for qvis
 
 use std::{
-    borrow::Cow,
     io::{IsTerminal, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -144,6 +144,11 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     qlog: Option<PathBuf>,
 
+    /// Merge qlog files (e.g. the client and server trace of one connection)
+    /// into OUT, client first, as qvis's sequence diagram expects; then exit
+    #[arg(long, value_names = ["OUT", "SQLOG"], num_args = 2.., conflicts_with = "listen")]
+    merge_qlog: Vec<PathBuf>,
+
     /// Client: remote host
     host: Option<String>,
 
@@ -155,6 +160,13 @@ fn main() -> Result<()> {
     LazyLock::force(&START);
     let args = Args::parse();
     VERBOSE.store(args.verbose, Ordering::Relaxed);
+    if let [out, inputs @ ..] = args.merge_qlog.as_slice() {
+        if let Err(e) = merge_qlog(out, inputs) {
+            log!("Error: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.verbose >= 3 {
         tracing_subscriber::fmt()
             .with_max_level(if args.verbose >= 4 { LevelFilter::TRACE } else { LevelFilter::DEBUG })
@@ -236,7 +248,9 @@ fn peer_addr(conn: &Connection) -> SocketAddr {
 }
 
 /// With --qlog, a qlog stream writing to DIR/<time>-<role>-<peer>.sqlog.
-fn qlog(args: &Args, role: &'static str, peer: SocketAddr) -> Result<Option<QlogStream>> {
+/// `odcid`: the client's original destination connection ID, known up front
+/// only on the server; the client's writer learns it from its first event.
+fn qlog(args: &Args, role: &'static str, peer: SocketAddr, odcid: Option<&[u8]>) -> Result<Option<QlogStream>> {
     let Some(dir) = &args.qlog else {
         return Ok(None);
     };
@@ -247,7 +261,13 @@ fn qlog(args: &Args, role: &'static str, peer: SocketAddr) -> Result<Option<Qlog
     // Unbuffered (one write per record), so the trace is complete even though
     // we exit without dropping everything.
     let file = std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-    let writer = QlogFixup { file, role, buf: Vec::new() };
+    let writer = QlogFixup {
+        file,
+        role,
+        group_id: odcid.map(hex),
+        pending_header: None,
+        buf: Vec::new(),
+    };
     vlog!(1, "{peer}: writing qlog to {}", path.display());
     let mut config = QlogConfig::default();
     config
@@ -294,7 +314,7 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
         let peer = canonical(incoming.remote_address());
         vlog!(2, "{peer}: incoming connection attempt, address validated: {}", incoming.remote_address_validated());
         // A per-connection config, so each connection gets its own qlog file.
-        let connecting = match qlog(args, "server", peer)? {
+        let connecting = match qlog(args, "server", peer, Some(&incoming.orig_dst_cid()))? {
             Some(stream) => {
                 let mut config = config.clone();
                 config.transport_config(transport(Some(stream)));
@@ -439,7 +459,7 @@ async fn client(args: &Args) -> Result<()> {
     for &addr in &addrs {
         vlog!(1, "trying {addr}");
         let mut config = config.clone();
-        config.transport_config(transport(qlog(args, "client", addr)?));
+        config.transport_config(transport(qlog(args, "client", addr, None)?));
         match tokio::time::timeout(Duration::from_secs(3), endpoint.connect_with(config, addr, sni)?).await {
             Ok(Ok(c)) => {
                 conn = Some(c);
@@ -687,9 +707,18 @@ fn frame_counts(s: &ConnectionStats, sent: bool) -> String {
     if parts.is_empty() { "-".into() } else { parts.join(", ") }
 }
 
-/// Fixes two things quinn gets wrong in its qlog output, on the way to the file:
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Fixes what quinn gets wrong in its qlog output, on the way to the file:
 /// - the trace header says vantage point "unknown" (quinn has no setting for
 ///   it), so qvis has to guess whether it is a client or server trace;
+/// - events are grouped by the peer's *current* connection ID, which differs
+///   between the two ends and changes during the handshake. qlog wants the
+///   ODCID (the client's first destination CID) on both ends, so the client
+///   and server traces of one connection can be matched; it is also put in
+///   the header as `common_fields.group_id`;
 /// - RTTs of `recovery:metrics_updated` events are in seconds, but qlog (and
 ///   qvis) use milliseconds.
 ///
@@ -698,6 +727,10 @@ struct QlogFixup {
     file: std::fs::File,
     /// "client" or "server"
     role: &'static str,
+    /// ODCID as hex. The client only learns it from its first event (its first
+    /// Initial, sent to the ODCID), so it holds the header back until then.
+    group_id: Option<String>,
+    pending_header: Option<serde_json::Value>,
     buf: Vec<u8>,
 }
 
@@ -706,7 +739,7 @@ impl Write for QlogFixup {
         self.buf.extend_from_slice(data);
         while let Some(end) = self.buf.iter().position(|&b| b == b'\n') {
             let record: Vec<u8> = self.buf.drain(..=end).collect();
-            self.file.write_all(&fix_qlog_record(&record, self.role))?;
+            self.record(&record)?;
         }
         Ok(data.len())
     }
@@ -716,34 +749,136 @@ impl Write for QlogFixup {
     }
 }
 
-fn fix_qlog_record<'a>(record: &'a [u8], role: &str) -> Cow<'a, [u8]> {
-    let json = record.strip_prefix(b"\x1e").unwrap_or(record);
-    let Ok(mut event) = serde_json::from_slice::<serde_json::Value>(json) else {
-        return Cow::Borrowed(record);
-    };
-    if let Some(vp) = event.pointer_mut("/trace/vantage_point") {
-        // The header record, first in the file.
-        *vp = serde_json::json!({ "name": "qnc", "type": role });
-    } else if event["name"] == "recovery:metrics_updated"
-        && let Some(data) = event.get_mut("data").and_then(|d| d.as_object_mut())
-    {
-        for key in ["min_rtt", "smoothed_rtt", "latest_rtt", "rtt_variance"] {
-            if let Some(v) = data.get_mut(key)
-                && let Some(secs) = v.as_f64()
-            {
-                // f32 seconds -> ms, rounded to µs to drop float noise.
-                *v = ((secs * 1e6).round() / 1e3).into();
+impl QlogFixup {
+    fn record(&mut self, record: &[u8]) -> std::io::Result<()> {
+        let json = record.strip_prefix(b"\x1e").unwrap_or(record);
+        let Ok(mut event) = serde_json::from_slice::<serde_json::Value>(json) else {
+            return self.file.write_all(record);
+        };
+
+        if let Some(vp) = event.pointer_mut("/trace/vantage_point") {
+            *vp = serde_json::json!({ "name": "qnc", "type": self.role });
+            if self.group_id.is_some() {
+                return self.write_header(event);
+            }
+            self.pending_header = Some(event);
+            return Ok(());
+        }
+
+        if let Some(id) = event.get_mut("group_id") {
+            match &self.group_id {
+                Some(odcid) => *id = odcid.clone().into(),
+                None => self.group_id = id.as_str().map(String::from),
             }
         }
-    } else {
-        return Cow::Borrowed(record);
+        if let Some(header) = self.pending_header.take() {
+            self.write_header(header)?;
+        }
+
+        if event["name"] == "recovery:metrics_updated"
+            && let Some(data) = event.get_mut("data").and_then(|d| d.as_object_mut())
+        {
+            for key in ["min_rtt", "smoothed_rtt", "latest_rtt", "rtt_variance"] {
+                if let Some(v) = data.get_mut(key)
+                    && let Some(secs) = v.as_f64()
+                {
+                    // f32 seconds -> ms, rounded to µs to drop float noise.
+                    *v = ((secs * 1e6).round() / 1e3).into();
+                }
+            }
+        }
+        self.write_json(&event)
     }
-    let mut out = b"\x1e".to_vec();
-    if serde_json::to_writer(&mut out, &event).is_err() {
-        return Cow::Borrowed(record);
+
+    fn write_header(&mut self, mut header: serde_json::Value) -> std::io::Result<()> {
+        if let (Some(trace), Some(odcid)) = (header.get_mut("trace").and_then(|t| t.as_object_mut()), &self.group_id) {
+            trace.insert("common_fields".into(), serde_json::json!({ "group_id": odcid, "ODCID": odcid }));
+        }
+        self.write_json(&header)
     }
-    out.push(b'\n');
-    Cow::Owned(out)
+
+    fn write_json(&mut self, value: &serde_json::Value) -> std::io::Result<()> {
+        let mut out = b"\x1e".to_vec();
+        serde_json::to_writer(&mut out, value)?;
+        out.push(b'\n');
+        self.file.write_all(&out)
+    }
+}
+
+/// One trace of a JSON-SEQ qlog file, as a JSON-format trace object.
+struct Trace {
+    path: PathBuf,
+    role: String,
+    group_id: Option<String>,
+    trace: serde_json::Value,
+}
+
+fn read_sqlog(path: &Path) -> Result<Trace> {
+    let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut records = raw.split(|&b| b == 0x1e).filter(|r| !r.trim_ascii().is_empty());
+    let header: serde_json::Value = serde_json::from_slice(records.next().context("empty file")?)?;
+    let mut trace = header.get("trace").cloned().context("no trace header (not a JSON-SEQ qlog?)")?;
+    let events = records
+        .map(serde_json::from_slice)
+        .collect::<Result<Vec<serde_json::Value>, _>>()
+        .context("bad event record (file truncated?)")?;
+
+    // Files from before qnc set it say "unknown"; guess like qvis does: the
+    // client sends Initial 0 before it receives one.
+    let mut role = trace.pointer("/vantage_point/type").and_then(|t| t.as_str()).unwrap_or("unknown").to_string();
+    if role == "unknown" {
+        let first = |name: &str| {
+            events.iter().position(|e| {
+                e["name"] == name && e.pointer("/data/header/packet_type").is_some_and(|t| t == "initial")
+            })
+        };
+        role = match (first("transport:packet_sent"), first("transport:packet_received")) {
+            (Some(sent), Some(recv)) if sent < recv => "client",
+            _ => "server",
+        }
+        .into();
+        trace["vantage_point"] = serde_json::json!({ "type": role, "name": "guessed by qnc --merge-qlog" });
+    }
+    let group_id = trace
+        .pointer("/common_fields/group_id")
+        .or_else(|| events.first().and_then(|e| e.get("group_id")))
+        .and_then(|g| g.as_str())
+        .map(String::from);
+    trace["events"] = events.into();
+    Ok(Trace { path: path.to_owned(), role, group_id, trace })
+}
+
+/// Writes the traces as one JSON-format qlog with client traces first: qvis's
+/// sequence diagram puts the first trace on the left as the client, whatever
+/// its vantage point says.
+fn merge_qlog(out: &Path, inputs: &[PathBuf]) -> Result<()> {
+    let mut traces = inputs.iter().map(|p| read_sqlog(p).with_context(|| format!("{}", p.display()))).collect::<Result<Vec<_>>>()?;
+    traces.sort_by_key(|t| match t.role.as_str() {
+        "client" => 0,
+        "server" => 1,
+        _ => 2,
+    });
+    for t in &traces {
+        log!("{}: {} trace, group_id {}", t.path.display(), t.role, t.group_id.as_deref().unwrap_or("-"));
+    }
+    let groups: std::collections::BTreeSet<_> = traces.iter().map(|t| &t.group_id).collect();
+    if groups.len() > 1 {
+        log!("warning: the traces have different group_ids, so they may not be the same connection (files from qnc before it used the ODCID always differ)");
+    }
+
+    let title = traces.iter().filter_map(|t| t.trace["title"].as_str()).collect::<Vec<_>>().join(" + ");
+    let file = serde_json::json!({
+        "qlog_version": "0.3",
+        "qlog_format": "JSON",
+        "title": format!("qnc merged: {title}"),
+        "traces": traces.into_iter().map(|t| t.trace).collect::<Vec<_>>(),
+    });
+    let f = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
+    let mut w = std::io::BufWriter::new(f);
+    serde_json::to_writer(&mut w, &file)?;
+    w.flush()?;
+    log!("wrote {}", out.display());
+    Ok(())
 }
 
 /// Accepts any server certificate (still checks the handshake signatures).
