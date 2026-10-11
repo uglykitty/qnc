@@ -44,6 +44,10 @@ use tracing_subscriber::{
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 static VERBOSE: AtomicU8 = AtomicU8::new(0);
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// Application error code sent in CONNECTION_CLOSE when we are interrupted.
+const CLOSE_INTERRUPTED: u32 = 1;
 
 fn verbose(level: u8) -> bool {
     VERBOSE.load(Ordering::Relaxed) >= level
@@ -160,6 +164,10 @@ fn main() -> Result<()> {
     });
     // A pending blocking read on stdin would keep the runtime from shutting down.
     rt.shutdown_background();
+    if INTERRUPTED.load(Ordering::Relaxed) {
+        // Errors from connections we closed ourselves are expected; 130 = 128 + SIGINT.
+        std::process::exit(130);
+    }
     if let Err(e) = result {
         log!("Error: {e:#}");
         std::process::exit(1);
@@ -169,6 +177,33 @@ fn main() -> Result<()> {
 
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// On the first SIGINT/SIGTERM, close every connection of `endpoint` with a
+/// CONNECTION_CLOSE frame so peers learn right away instead of waiting for
+/// their idle timeout. The normal code path then finishes; a second signal, or
+/// a close that takes too long, exits immediately.
+fn close_on_signal(endpoint: Endpoint) -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut int = signal(SignalKind::interrupt())?;
+    let mut term = signal(SignalKind::terminate())?;
+    tokio::spawn(async move {
+        let name = tokio::select! {
+            _ = int.recv() => "SIGINT",
+            _ = term.recv() => "SIGTERM",
+        };
+        INTERRUPTED.store(true, Ordering::Relaxed);
+        vlog!(1, "{name}: closing {} connection(s), press Ctrl-C again to quit now", endpoint.open_connections());
+        endpoint.close(CLOSE_INTERRUPTED.into(), b"interrupted");
+        tokio::select! {
+            _ = int.recv() => vlog!(1, "SIGINT again, exiting"),
+            _ = term.recv() => vlog!(1, "SIGTERM again, exiting"),
+            // Closing waits 3 PTOs at most; this only guards against a hang.
+            _ = tokio::time::sleep(Duration::from_secs(3)) => log!("close timed out, exiting"),
+        }
+        std::process::exit(130);
+    });
+    Ok(())
 }
 
 fn transport(qlog: Option<QlogStream>) -> Arc<TransportConfig> {
@@ -228,6 +263,7 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     config.transport_config(transport(None));
     let endpoint = Endpoint::server(config.clone(), addr)?;
+    close_on_signal(endpoint.clone())?;
     vlog!(1, "listening on udp {}", endpoint.local_addr()?);
 
     while let Some(incoming) = endpoint.accept().await {
@@ -265,8 +301,9 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
             Err(e) => Err(e.into()),
         };
         finish(&conn);
-        if let Err(e) = result {
-            log!("{}: {e}", conn.remote_address());
+        match result {
+            Err(e) if !INTERRUPTED.load(Ordering::Relaxed) => log!("{}: {e:#}", conn.remote_address()),
+            _ => {}
         }
         if !args.keep {
             break;
@@ -336,6 +373,7 @@ async fn client(args: &Args) -> Result<()> {
     let any6: SocketAddr = "[::]:0".parse()?;
     let any4: SocketAddr = "0.0.0.0:0".parse()?;
     let endpoint = Endpoint::client(any6).or_else(|_| Endpoint::client(any4))?;
+    close_on_signal(endpoint.clone())?;
 
     // UDP gives no "connection refused", so try each address with a timeout
     // (e.g. "localhost" resolves to ::1 first while the server is on 127.0.0.1).
@@ -397,14 +435,17 @@ async fn pipe(mut send: SendStream, mut recv: RecvStream) -> Result<()> {
     match copied {
         Ok(n) => vlog!(2, "{id}: received FIN after {n} bytes"),
         Err(e) => {
-            // The peer closing the whole connection (like nc exiting) counts as EOF.
-            let closed = e.get_ref().and_then(|e| e.downcast_ref::<ReadError>()).is_some_and(|e| {
-                matches!(e, ReadError::ConnectionLost(ConnectionError::ApplicationClosed(_)))
-            });
-            if !closed {
-                return Err(e.into());
+            // The peer closing the whole connection (like nc exiting) counts as
+            // EOF, and so does our own close on Ctrl-C.
+            match e.get_ref().and_then(|e| e.downcast_ref::<ReadError>()) {
+                Some(ReadError::ConnectionLost(ConnectionError::ApplicationClosed(c))) => {
+                    vlog!(2, "{id}: peer closed the connection: {c}");
+                }
+                Some(ReadError::ConnectionLost(ConnectionError::LocallyClosed)) => {
+                    vlog!(2, "{id}: connection closed locally");
+                }
+                _ => return Err(e.into()),
             }
-            vlog!(2, "{id}: peer closed the connection");
         }
     }
 
@@ -414,7 +455,7 @@ async fn pipe(mut send: SendStream, mut recv: RecvStream) -> Result<()> {
         if stdin_eof.load(Ordering::Relaxed) {
             vlog!(2, "{id}: not waiting for the peer to acknowledge our data");
         } else {
-            vlog!(2, "{id}: peer is done, ignoring the rest of stdin");
+            vlog!(2, "{id}: receiving is over, ignoring the rest of stdin");
         }
         up.abort();
     }
