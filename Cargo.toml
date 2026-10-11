@@ -1,0 +1,13 @@
+[package]
+name = "qnc"
+version = "0.1.0"
+edition = "2024"
+description = "netcat-like QUIC client/server"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+quinn = "0.11"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["full"] }
