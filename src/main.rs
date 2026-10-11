@@ -7,7 +7,12 @@
 //! Each connection carries one bidirectional stream: stdin is sent to the peer,
 //! what the peer sends is written to stdout.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, LazyLock},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
@@ -22,6 +27,16 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime, pem::PemObject},
 };
 use tokio::io::AsyncWriteExt;
+
+static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// `eprintln!` prefixed with the time since start, as seconds.milliseconds.
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        let t = START.elapsed();
+        eprintln!("{}.{:03} {}", t.as_secs(), t.subsec_millis(), format_args!($($arg)*));
+    }};
+}
 
 #[derive(Parser)]
 #[command(version, about = "netcat-like QUIC client/server")]
@@ -78,6 +93,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    LazyLock::force(&START);
     let args = Args::parse();
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(async {
@@ -89,7 +105,11 @@ fn main() -> Result<()> {
     });
     // A pending blocking read on stdin would keep the runtime from shutting down.
     rt.shutdown_background();
-    result
+    if let Err(e) = result {
+        log!("Error: {e:#}");
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn provider() -> Arc<CryptoProvider> {
@@ -132,19 +152,19 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
     config.transport_config(transport());
     let endpoint = Endpoint::server(config, addr)?;
     if args.verbose {
-        eprintln!("listening on udp {}", endpoint.local_addr()?);
+        log!("listening on udp {}", endpoint.local_addr()?);
     }
 
     while let Some(incoming) = endpoint.accept().await {
         let conn = match incoming.await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("handshake failed: {e}");
+                log!("handshake failed: {e}");
                 continue;
             }
         };
         if args.verbose {
-            eprintln!("connection from {}", conn.remote_address());
+            log!("connection from {}", conn.remote_address());
         }
 
         if args.echo {
@@ -158,7 +178,7 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
         };
         finish(&conn, args.verbose);
         if let Err(e) = result {
-            eprintln!("{}: {e}", conn.remote_address());
+            log!("{}: {e}", conn.remote_address());
         }
         if !args.keep {
             break;
@@ -178,7 +198,7 @@ async fn echo(conn: Connection, verbose: bool) {
         });
     }
     if verbose {
-        eprintln!("{} closed", conn.remote_address());
+        log!("{} closed", conn.remote_address());
         print_stats(&conn);
     }
 }
@@ -228,7 +248,7 @@ async fn client(args: &Args) -> Result<()> {
     let mut conn = None;
     for &addr in &addrs {
         if args.verbose {
-            eprintln!("trying {addr}");
+            log!("trying {addr}");
         }
         match tokio::time::timeout(Duration::from_secs(3), endpoint.connect(addr, sni)?).await {
             Ok(Ok(c)) => {
@@ -236,14 +256,14 @@ async fn client(args: &Args) -> Result<()> {
                 break;
             }
             Ok(Err(e)) if addrs.len() == 1 => return Err(anyhow!(e).context(format!("connecting to {addr}"))),
-            Ok(Err(e)) => eprintln!("{addr}: {e}"),
-            Err(_) => eprintln!("{addr}: handshake timed out"),
+            Ok(Err(e)) => log!("{addr}: {e}"),
+            Err(_) => log!("{addr}: handshake timed out"),
         }
     }
     let conn = conn.ok_or_else(|| anyhow!("could not connect to {host}:{port}"))?;
     let addr = conn.remote_address();
     if args.verbose {
-        eprintln!("connected to {addr} from {}", endpoint.local_addr()?);
+        log!("connected to {addr} from {}", endpoint.local_addr()?);
     }
 
     let (send, recv) = conn.open_bi().await?;
@@ -300,7 +320,7 @@ fn finish(conn: &Connection, verbose: bool) {
 
 fn print_stats(conn: &Connection) {
     let s = conn.stats();
-    eprintln!(
+    log!(
         "{}: rtt {:?}, cwnd {} B, sent {} B / {} dgrams, recv {} B / {} dgrams, lost {} pkts",
         conn.remote_address(),
         s.path.rtt,
