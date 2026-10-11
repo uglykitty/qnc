@@ -72,7 +72,8 @@ terminal there is line editing and history, Tab completes command names and
 stream IDs, Ctrl-C clears the line, and Ctrl-D quits after sending FIN on every
 stream.
 
-Both sides can use `-i`. Against a server in the default stream mode, note that
+Both sides can use `-i`. A server with `-i` shows the console right away; while
+it waits for a client, Ctrl-D or `/quit` stops it. Against a server in the default stream mode, note that
 it serves only the first stream and closes the connection when that stream ends.
 
 ## Transport settings

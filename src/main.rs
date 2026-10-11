@@ -384,7 +384,21 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
     close_on_signal(endpoint.clone())?;
     vlog!(1, "listening on udp {}", endpoint.local_addr()?);
 
-    while let Some(incoming) = endpoint.accept().await {
+    if args.interactive {
+        interactive::waiting(endpoint.local_addr()?);
+    }
+    loop {
+        // -i: until a client comes, the console answers lines itself, and
+        // Ctrl-D or /quit stops the server.
+        let incoming = if args.interactive {
+            tokio::select! {
+                incoming = endpoint.accept() => incoming,
+                () = interactive::idle() => None,
+            }
+        } else {
+            endpoint.accept().await
+        };
+        let Some(incoming) = incoming else { break };
         let peer = canonical(incoming.remote_address());
         vlog!(2, "{peer}: incoming connection attempt, address validated: {}", incoming.remote_address_validated());
         // A per-connection config, so each connection gets its own qlog file.

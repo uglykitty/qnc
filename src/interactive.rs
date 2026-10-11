@@ -395,6 +395,28 @@ async fn accept_streams(s: Shared) {
 
 // ---------------------------------------------------------------- commands
 
+/// Server: starts the console before the first client arrives.
+pub fn waiting(addr: std::net::SocketAddr) {
+    set_prompt(None);
+    info(format_args!("listening on udp {addr}, waiting for a client; Ctrl-D quits"));
+}
+
+/// Server, between connections: handles console input until stdin ends
+/// (Ctrl-D) or /quit. Cancel-safe: a line is fully handled once received.
+pub async fn idle() {
+    let mut lines = console().lines.lock().await;
+    while let Some(line) = lines.recv().await {
+        let quit = matches!(line.trim(), "/quit" | "/q");
+        if !quit && !line.trim().is_empty() {
+            info("no connection yet, waiting for a client; Ctrl-D or /quit stops the server");
+        }
+        let _ = console().done.lock().unwrap().send(());
+        if quit {
+            return;
+        }
+    }
+}
+
 /// Runs the console on `conn` until it is closed (by either side) or stdin
 /// ends. Returns true if stdin ended, so a server should stop accepting.
 pub async fn run(conn: &Connection) -> Result<bool> {
