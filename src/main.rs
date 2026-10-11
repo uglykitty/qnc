@@ -227,9 +227,12 @@ fn close_on_signal(endpoint: Endpoint) -> Result<()> {
     Ok(())
 }
 
-fn transport(qlog: Option<QlogStream>) -> Arc<TransportConfig> {
+/// `keep_alive`: send a PING after 10 s without other ack-eliciting packets, so
+/// the connection outlives the idle timeout and NAT mappings stay open. Only
+/// the client does this; the server's ACKs to those PINGs keep its side alive.
+fn transport(qlog: Option<QlogStream>, keep_alive: bool) -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
-    t.keep_alive_interval(Some(Duration::from_secs(10)));
+    t.keep_alive_interval(keep_alive.then_some(Duration::from_secs(10)));
     t.qlog_stream(qlog);
     Arc::new(t)
 }
@@ -302,7 +305,7 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
     tls.key_log = Arc::new(KeyLogFile::new());
 
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
-    config.transport_config(transport(None));
+    config.transport_config(transport(None, false));
     let endpoint = Endpoint::server(config.clone(), addr)?;
     close_on_signal(endpoint.clone())?;
     vlog!(1, "listening on udp {}", endpoint.local_addr()?);
@@ -314,7 +317,7 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
         let connecting = match qlog(args, "server", peer, Some(&incoming.orig_dst_cid()))? {
             Some(stream) => {
                 let mut config = config.clone();
-                config.transport_config(transport(Some(stream)));
+                config.transport_config(transport(Some(stream), false));
                 incoming.accept_with(Arc::new(config))
             }
             None => incoming.accept(),
@@ -459,7 +462,7 @@ async fn client(args: &Args) -> Result<()> {
     for &addr in &addrs {
         vlog!(1, "trying {addr}");
         let mut config = config.clone();
-        config.transport_config(transport(qlog(args, "client", addr, None)?));
+        config.transport_config(transport(qlog(args, "client", addr, None)?, true));
         match tokio::time::timeout(Duration::from_secs(3), endpoint.connect_with(config, addr, sni)?).await {
             Ok(Ok(c)) => {
                 conn = Some(c);
