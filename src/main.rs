@@ -236,7 +236,7 @@ fn peer_addr(conn: &Connection) -> SocketAddr {
 }
 
 /// With --qlog, a qlog stream writing to DIR/<time>-<role>-<peer>.sqlog.
-fn qlog(args: &Args, role: &str, peer: SocketAddr) -> Result<Option<QlogStream>> {
+fn qlog(args: &Args, role: &'static str, peer: SocketAddr) -> Result<Option<QlogStream>> {
     let Some(dir) = &args.qlog else {
         return Ok(None);
     };
@@ -247,7 +247,7 @@ fn qlog(args: &Args, role: &str, peer: SocketAddr) -> Result<Option<QlogStream>>
     // Unbuffered (one write per record), so the trace is complete even though
     // we exit without dropping everything.
     let file = std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-    let writer = QlogRttFix { file, buf: Vec::new() };
+    let writer = QlogFixup { file, role, buf: Vec::new() };
     vlog!(1, "{peer}: writing qlog to {}", path.display());
     let mut config = QlogConfig::default();
     config
@@ -687,20 +687,26 @@ fn frame_counts(s: &ConnectionStats, sent: bool) -> String {
     if parts.is_empty() { "-".into() } else { parts.join(", ") }
 }
 
-/// quinn writes the RTTs of `recovery:metrics_updated` qlog events in seconds,
-/// but qlog (and qvis) use milliseconds. This writer fixes them on the way to
-/// the file. Records are JSON-SEQ: RS (0x1e), JSON, LF.
-struct QlogRttFix {
+/// Fixes two things quinn gets wrong in its qlog output, on the way to the file:
+/// - the trace header says vantage point "unknown" (quinn has no setting for
+///   it), so qvis has to guess whether it is a client or server trace;
+/// - RTTs of `recovery:metrics_updated` events are in seconds, but qlog (and
+///   qvis) use milliseconds.
+///
+/// Records are JSON-SEQ: RS (0x1e), JSON, LF.
+struct QlogFixup {
     file: std::fs::File,
+    /// "client" or "server"
+    role: &'static str,
     buf: Vec<u8>,
 }
 
-impl Write for QlogRttFix {
+impl Write for QlogFixup {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.buf.extend_from_slice(data);
         while let Some(end) = self.buf.iter().position(|&b| b == b'\n') {
             let record: Vec<u8> = self.buf.drain(..=end).collect();
-            self.file.write_all(&rtt_to_millis(&record))?;
+            self.file.write_all(&fix_qlog_record(&record, self.role))?;
         }
         Ok(data.len())
     }
@@ -710,24 +716,27 @@ impl Write for QlogRttFix {
     }
 }
 
-fn rtt_to_millis(record: &[u8]) -> Cow<'_, [u8]> {
+fn fix_qlog_record<'a>(record: &'a [u8], role: &str) -> Cow<'a, [u8]> {
     let json = record.strip_prefix(b"\x1e").unwrap_or(record);
     let Ok(mut event) = serde_json::from_slice::<serde_json::Value>(json) else {
         return Cow::Borrowed(record);
     };
-    if event["name"] != "recovery:metrics_updated" {
-        return Cow::Borrowed(record);
-    }
-    let Some(data) = event.get_mut("data").and_then(|d| d.as_object_mut()) else {
-        return Cow::Borrowed(record);
-    };
-    for key in ["min_rtt", "smoothed_rtt", "latest_rtt", "rtt_variance"] {
-        if let Some(v) = data.get_mut(key)
-            && let Some(secs) = v.as_f64()
-        {
-            // f32 seconds -> ms, rounded to µs to drop float noise.
-            *v = ((secs * 1e6).round() / 1e3).into();
+    if let Some(vp) = event.pointer_mut("/trace/vantage_point") {
+        // The header record, first in the file.
+        *vp = serde_json::json!({ "name": "qnc", "type": role });
+    } else if event["name"] == "recovery:metrics_updated"
+        && let Some(data) = event.get_mut("data").and_then(|d| d.as_object_mut())
+    {
+        for key in ["min_rtt", "smoothed_rtt", "latest_rtt", "rtt_variance"] {
+            if let Some(v) = data.get_mut(key)
+                && let Some(secs) = v.as_f64()
+            {
+                // f32 seconds -> ms, rounded to µs to drop float noise.
+                *v = ((secs * 1e6).round() / 1e3).into();
+            }
         }
+    } else {
+        return Cow::Borrowed(record);
     }
     let mut out = b"\x1e".to_vec();
     if serde_json::to_writer(&mut out, &event).is_err() {
