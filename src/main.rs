@@ -5,7 +5,8 @@
 //!   qnc -k localhost 4433                        # client, skip verification
 //!
 //! Each connection carries one bidirectional stream: stdin is sent to the peer,
-//! what the peer sends is written to stdout.
+//! what the peer sends is written to stdout. With -u, unreliable QUIC DATAGRAM
+//! frames (RFC 9221) are used instead, like `nc -u`.
 //!
 //! For learning/debugging the protocol:
 //!   -v .. -vvvv                 increasingly detailed logs (see --help)
@@ -28,7 +29,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Parser};
 use quinn::{
     Connection, ConnectionError, ConnectionStats, Endpoint, QlogConfig, QlogStream, ReadError, RecvStream,
-    SendStream, TransportConfig,
+    SendDatagramError, SendStream, TransportConfig,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
 use rustls::{
@@ -37,7 +38,8 @@ use rustls::{
     crypto::CryptoProvider,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime, pem::PemObject},
 };
-use tokio::io::AsyncWriteExt;
+use bytes::Bytes;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::{
     filter::LevelFilter,
     fmt::{format::Writer, time::FormatTime},
@@ -92,9 +94,18 @@ struct Args {
     #[arg(long, requires = "listen")]
     keep: bool,
 
-    /// Server: echo every stream back, serving many clients concurrently
+    /// Server: echo every stream (or datagram, with -u) back, serving many clients concurrently
     #[arg(long, requires = "listen")]
     echo: bool,
+
+    /// Use unreliable QUIC DATAGRAM frames instead of a stream (like nc -u);
+    /// both sides need it
+    #[arg(short = 'u', long)]
+    datagram: bool,
+
+    /// With -u: after stdin EOF, keep receiving for SECS, then close
+    #[arg(short = 'q', value_name = "SECS", default_value_t = 1.0, requires = "datagram")]
+    quit_after: f64,
 
     /// Server: certificate chain (PEM); self-signed if omitted
     #[arg(long, requires_all = ["listen", "key"])]
@@ -302,16 +313,20 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
         log_handshake(&conn);
 
         if args.echo {
-            tokio::spawn(echo(conn));
+            tokio::spawn(echo(conn, args.datagram));
             continue;
         }
 
-        let result = match conn.accept_bi().await {
-            Ok((send, recv)) => {
-                vlog!(2, "{}: accepted {}", peer_addr(&conn), send.id());
-                pipe(send, recv).await
+        let result = if args.datagram {
+            datagram_pipe(&conn, linger(args)?).await
+        } else {
+            match conn.accept_bi().await {
+                Ok((send, recv)) => {
+                    vlog!(2, "{}: accepted {}", peer_addr(&conn), send.id());
+                    pipe(send, recv).await
+                }
+                Err(e) => Err(e.into()),
             }
-            Err(e) => Err(e.into()),
         };
         finish(&conn);
         match result {
@@ -326,9 +341,19 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-async fn echo(conn: Connection) {
+async fn echo(conn: Connection, datagram: bool) {
     let peer = peer_addr(&conn);
-    let reason = loop {
+    let reason = if datagram { echo_datagrams(&conn).await } else { echo_streams(&conn).await };
+    vlog!(1, "{peer} closed");
+    vlog!(2, "{peer}: close reason: {reason}");
+    if verbose(1) {
+        print_stats(&conn);
+    }
+}
+
+async fn echo_streams(conn: &Connection) -> ConnectionError {
+    let peer = peer_addr(conn);
+    loop {
         let (mut send, mut recv) = match conn.accept_bi().await {
             Ok(s) => s,
             Err(e) => break e,
@@ -341,12 +366,31 @@ async fn echo(conn: Connection) {
             vlog!(2, "{peer}: {} echoed {n} bytes", send.id());
             anyhow::Ok(())
         });
-    };
-    vlog!(1, "{peer} closed");
-    vlog!(2, "{peer}: close reason: {reason}");
-    if verbose(1) {
-        print_stats(&conn);
     }
+}
+
+async fn echo_datagrams(conn: &Connection) -> ConnectionError {
+    let peer = peer_addr(conn);
+    let (mut count, mut bytes) = (0u64, 0u64);
+    let reason = loop {
+        let data = match conn.read_datagram().await {
+            Ok(d) => d,
+            Err(e) => break e,
+        };
+        let len = data.len();
+        match conn.send_datagram_wait(data).await {
+            Ok(()) => {
+                count += 1;
+                bytes += len as u64;
+                vlog!(2, "{peer}: echoed datagram of {len} bytes");
+            }
+            Err(SendDatagramError::ConnectionLost(e)) => break e,
+            // e.g. the peer accepts smaller datagrams than it sends us
+            Err(e) => log!("{peer}: dropping datagram of {len} bytes: {e}"),
+        }
+    };
+    vlog!(2, "{peer}: echoed {count} datagrams, {bytes} bytes");
+    reason
 }
 
 // ---------------------------------------------------------------- client
@@ -411,9 +455,13 @@ async fn client(args: &Args) -> Result<()> {
     vlog!(1, "connected to {addr} from {}", endpoint.local_addr()?);
     log_handshake(&conn);
 
-    let (send, recv) = conn.open_bi().await?;
-    vlog!(2, "{addr}: opened {}", send.id());
-    let result = pipe(send, recv).await;
+    let result = if args.datagram {
+        datagram_pipe(&conn, linger(args)?).await
+    } else {
+        let (send, recv) = conn.open_bi().await?;
+        vlog!(2, "{addr}: opened {}", send.id());
+        pipe(send, recv).await
+    };
     finish(&conn);
     endpoint.wait_idle().await;
     result
@@ -475,6 +523,84 @@ async fn pipe(mut send: SendStream, mut recv: RecvStream) -> Result<()> {
     Ok(())
 }
 
+fn linger(args: &Args) -> Result<Duration> {
+    Duration::try_from_secs_f64(args.quit_after).map_err(|e| anyhow!("-q {}: {e}", args.quit_after))
+}
+
+/// Datagram mode: every stdin read becomes one DATAGRAM frame (split if it is
+/// larger than the peer accepts), every datagram received is written to stdout.
+/// Like UDP, datagrams may be lost or reordered and there is no EOF, so after
+/// our stdin ends we keep receiving for `linger`, then close the connection.
+async fn datagram_pipe(conn: &Connection, linger: Duration) -> Result<()> {
+    let peer = peer_addr(conn);
+    let Some(max) = conn.max_datagram_size() else {
+        bail!("{peer}: peer does not accept QUIC datagrams");
+    };
+    vlog!(2, "{peer}: datagram mode, max datagram size now {max} bytes");
+    // Nothing is queued yet, so this is what "queue empty" looks like.
+    let empty_queue_space = conn.datagram_send_buffer_space();
+
+    let up = async {
+        let mut stdin = tokio::io::stdin();
+        let mut buf = vec![0u8; 64 * 1024];
+        let (mut count, mut bytes) = (0u64, 0u64);
+        loop {
+            let n = stdin.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            // The limit follows the path MTU, which can grow during the connection.
+            let max = conn.max_datagram_size().unwrap_or(max);
+            for chunk in buf[..n].chunks(max) {
+                conn.send_datagram_wait(Bytes::copy_from_slice(chunk)).await?;
+                count += 1;
+                bytes += chunk.len() as u64;
+                vlog!(2, "{peer}: sent datagram of {} bytes", chunk.len());
+            }
+        }
+        // Let the queue drain onto the wire before we start the linger timer.
+        while conn.datagram_send_buffer_space() < empty_queue_space {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        vlog!(2, "{peer}: stdin EOF after {count} datagrams, {bytes} bytes");
+        anyhow::Ok(())
+    };
+
+    let down = async {
+        let mut stdout = tokio::io::stdout();
+        let (mut count, mut bytes) = (0u64, 0u64);
+        let result = loop {
+            match conn.read_datagram().await {
+                Ok(data) => {
+                    count += 1;
+                    bytes += data.len() as u64;
+                    vlog!(2, "{peer}: received datagram of {} bytes", data.len());
+                    stdout.write_all(&data).await?;
+                    stdout.flush().await?;
+                }
+                Err(ConnectionError::ApplicationClosed(c)) => {
+                    vlog!(2, "{peer}: peer closed the connection: {c}");
+                    break Ok(());
+                }
+                Err(ConnectionError::LocallyClosed) => break Ok(()),
+                Err(e) => break Err(e.into()),
+            }
+        };
+        vlog!(2, "{peer}: received {count} datagrams, {bytes} bytes");
+        result
+    };
+
+    tokio::pin!(down);
+    tokio::select! {
+        r = &mut down => r,
+        r = up => {
+            r?;
+            vlog!(2, "{peer}: receiving for {linger:?} more (-q)");
+            tokio::time::timeout(linger, down).await.unwrap_or(Ok(()))
+        }
+    }
+}
+
 fn finish(conn: &Connection) {
     conn.close(0u32.into(), b"bye");
     if verbose(1) {
@@ -518,6 +644,9 @@ fn print_stats(conn: &Connection) {
         s.udp_rx.datagrams,
         s.path.lost_packets,
     );
+    if s.frame_tx.datagram + s.frame_rx.datagram > 0 {
+        log!("{peer}: DATAGRAM frames sent {}, received {}", s.frame_tx.datagram, s.frame_rx.datagram);
+    }
     if verbose(2) {
         log!("{peer}: path {:?}", s.path);
         log!("{peer}: frames sent: {}", frame_counts(&s, true));

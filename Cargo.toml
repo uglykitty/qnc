@@ -6,6 +6,7 @@ description = "netcat-like QUIC client/server"
 
 [dependencies]
 anyhow = "1"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 quinn = { version = "0.11", features = ["qlog"] }
 rcgen = "0.13"
