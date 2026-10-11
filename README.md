@@ -5,9 +5,20 @@ and rustls. Like `nc`, it pipes stdin to the peer and the peer's data to stdout;
 on top of that it has an interactive mode for working with several streams, and
 logging/tracing options for learning and debugging the QUIC protocol.
 
-## Build
+## Install
+
+Install the latest version from GitHub into `~/.cargo/bin` (needs a Rust
+toolchain):
 
 ```sh
+cargo install --git https://github.com/uglykitty/qnc
+```
+
+Or build from a clone:
+
+```sh
+git clone https://github.com/uglykitty/qnc
+cd qnc
 cargo build --release        # binary at target/release/qnc
 cargo install --path .       # or install it into ~/.cargo/bin
 ```
