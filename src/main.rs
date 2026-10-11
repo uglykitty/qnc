@@ -12,7 +12,6 @@
 //!   -v .. -vvvv                 increasingly detailed logs (see --help)
 //!   --qlog DIR                  one qlog file per connection, view in https://qvis.quictools.info
 //!   SSLKEYLOGFILE=keys.txt      TLS secrets, lets Wireshark decrypt captured QUIC packets
-//!   --merge-qlog OUT A B        merge client + server traces into one file for qvis
 
 use std::{
     io::{IsTerminal, Write},
@@ -144,12 +143,6 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     qlog: Option<PathBuf>,
 
-    /// Merge qlog files (e.g. the client and server trace of one connection)
-    /// into OUT, client first, as qvis's sequence diagram expects; then exit.
-    /// Also repairs files from older qnc versions; one input is fine
-    #[arg(long, value_names = ["OUT", "SQLOG"], num_args = 2.., conflicts_with = "listen")]
-    merge_qlog: Vec<PathBuf>,
-
     /// Client: remote host
     host: Option<String>,
 
@@ -161,13 +154,6 @@ fn main() -> Result<()> {
     LazyLock::force(&START);
     let args = Args::parse();
     VERBOSE.store(args.verbose, Ordering::Relaxed);
-    if let [out, inputs @ ..] = args.merge_qlog.as_slice() {
-        if let Err(e) = merge_qlog(out, inputs) {
-            log!("Error: {e:#}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
     if args.verbose >= 3 {
         tracing_subscriber::fmt()
             .with_max_level(if args.verbose >= 4 { LevelFilter::TRACE } else { LevelFilter::DEBUG })
@@ -804,93 +790,6 @@ impl QlogFixup {
         out.push(b'\n');
         self.file.write_all(&out)
     }
-}
-
-/// One trace of a JSON-SEQ qlog file, as a JSON-format trace object.
-struct Trace {
-    path: PathBuf,
-    role: String,
-    group_id: Option<String>,
-    trace: serde_json::Value,
-}
-
-fn read_sqlog(path: &Path) -> Result<Trace> {
-    let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut records = raw.split(|&b| b == 0x1e).filter(|r| !r.trim_ascii().is_empty());
-    let header: serde_json::Value = serde_json::from_slice(records.next().context("empty file")?)?;
-    let mut trace = header.get("trace").cloned().context("no trace header (not a JSON-SEQ qlog?)")?;
-    let events = records
-        .map(serde_json::from_slice)
-        .collect::<Result<Vec<serde_json::Value>, _>>()
-        .context("bad event record (file truncated?)")?;
-
-    // Files from before qnc set it say "unknown"; guess like qvis does: the
-    // client sends Initial 0 before it receives one.
-    let mut role = trace.pointer("/vantage_point/type").and_then(|t| t.as_str()).unwrap_or("unknown").to_string();
-    if role == "unknown" {
-        let first = |name: &str| {
-            events.iter().position(|e| {
-                e["name"] == name && e.pointer("/data/header/packet_type").is_some_and(|t| t == "initial")
-            })
-        };
-        role = match (first("transport:packet_sent"), first("transport:packet_received")) {
-            (Some(sent), Some(recv)) if sent < recv => "client",
-            _ => "server",
-        }
-        .into();
-        trace["vantage_point"] = serde_json::json!({ "type": role, "name": "guessed by qnc --merge-qlog" });
-    }
-    let group_id = trace
-        .pointer("/common_fields/group_id")
-        .or_else(|| events.first().and_then(|e| e.get("group_id")))
-        .and_then(|g| g.as_str())
-        .map(String::from);
-    // Files from before qnc used the ODCID switch group_id mid-trace (on the
-    // client, after the first Initial), and qvis splits a trace by group_id,
-    // showing only the Initial. The first event's group_id is the ODCID there.
-    let mut events = events;
-    if let Some(id) = &group_id {
-        for e in &mut events {
-            if let Some(g) = e.get_mut("group_id") {
-                *g = id.as_str().into();
-            }
-        }
-    }
-    trace["events"] = events.into();
-    Ok(Trace { path: path.to_owned(), role, group_id, trace })
-}
-
-/// Writes the traces as one JSON-format qlog with client traces first: qvis's
-/// sequence diagram puts the first trace on the left as the client, whatever
-/// its vantage point says.
-fn merge_qlog(out: &Path, inputs: &[PathBuf]) -> Result<()> {
-    let mut traces = inputs.iter().map(|p| read_sqlog(p).with_context(|| format!("{}", p.display()))).collect::<Result<Vec<_>>>()?;
-    traces.sort_by_key(|t| match t.role.as_str() {
-        "client" => 0,
-        "server" => 1,
-        _ => 2,
-    });
-    for t in &traces {
-        log!("{}: {} trace, group_id {}", t.path.display(), t.role, t.group_id.as_deref().unwrap_or("-"));
-    }
-    let groups: std::collections::BTreeSet<_> = traces.iter().map(|t| &t.group_id).collect();
-    if groups.len() > 1 {
-        log!("warning: the traces have different group_ids, so they may not be the same connection (files from qnc before it used the ODCID always differ)");
-    }
-
-    let title = traces.iter().filter_map(|t| t.trace["title"].as_str()).collect::<Vec<_>>().join(" + ");
-    let file = serde_json::json!({
-        "qlog_version": "0.3",
-        "qlog_format": "JSON",
-        "title": format!("qnc merged: {title}"),
-        "traces": traces.into_iter().map(|t| t.trace).collect::<Vec<_>>(),
-    });
-    let f = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
-    let mut w = std::io::BufWriter::new(f);
-    serde_json::to_writer(&mut w, &file)?;
-    w.flush()?;
-    log!("wrote {}", out.display());
-    Ok(())
 }
 
 /// Accepts any server certificate (still checks the handshake signatures).
