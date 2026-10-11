@@ -13,7 +13,8 @@
 //!   SSLKEYLOGFILE=keys.txt      TLS secrets, lets Wireshark decrypt captured QUIC packets
 
 use std::{
-    io::IsTerminal,
+    borrow::Cow,
+    io::{IsTerminal, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -213,6 +214,16 @@ fn transport(qlog: Option<QlogStream>) -> Arc<TransportConfig> {
     Arc::new(t)
 }
 
+/// `[::ffff:1.2.3.4]:5` -> `1.2.3.4:5`. A dual-stack socket reports IPv4 peers
+/// as IPv4-mapped IPv6 addresses.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
+fn peer_addr(conn: &Connection) -> SocketAddr {
+    canonical(conn.remote_address())
+}
+
 /// With --qlog, a qlog stream writing to DIR/<time>-<role>-<peer>.sqlog.
 fn qlog(args: &Args, role: &str, peer: SocketAddr) -> Result<Option<QlogStream>> {
     let Some(dir) = &args.qlog else {
@@ -222,12 +233,14 @@ fn qlog(args: &Args, role: &str, peer: SocketAddr) -> Result<Option<QlogStream>>
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
     let peer_name: String = peer.to_string().chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '_' }).collect();
     let path = dir.join(format!("{}.{:03}-{role}-{peer_name}.sqlog", now.as_secs(), now.subsec_millis()));
-    // Unbuffered, so the trace is complete even though we exit without dropping everything.
+    // Unbuffered (one write per record), so the trace is complete even though
+    // we exit without dropping everything.
     let file = std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+    let writer = QlogRttFix { file, buf: Vec::new() };
     vlog!(1, "{peer}: writing qlog to {}", path.display());
     let mut config = QlogConfig::default();
     config
-        .writer(Box::new(file))
+        .writer(Box::new(writer))
         .title(Some(format!("qnc {role}, peer {peer}")))
         .start_time(*START);
     Ok(config.into_stream())
@@ -267,7 +280,7 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
     vlog!(1, "listening on udp {}", endpoint.local_addr()?);
 
     while let Some(incoming) = endpoint.accept().await {
-        let peer = incoming.remote_address();
+        let peer = canonical(incoming.remote_address());
         vlog!(2, "{peer}: incoming connection attempt, address validated: {}", incoming.remote_address_validated());
         // A per-connection config, so each connection gets its own qlog file.
         let connecting = match qlog(args, "server", peer)? {
@@ -285,7 +298,7 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
                 continue;
             }
         };
-        vlog!(1, "connection from {}", conn.remote_address());
+        vlog!(1, "connection from {}", peer_addr(&conn));
         log_handshake(&conn);
 
         if args.echo {
@@ -295,14 +308,14 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
 
         let result = match conn.accept_bi().await {
             Ok((send, recv)) => {
-                vlog!(2, "{}: accepted {}", conn.remote_address(), send.id());
+                vlog!(2, "{}: accepted {}", peer_addr(&conn), send.id());
                 pipe(send, recv).await
             }
             Err(e) => Err(e.into()),
         };
         finish(&conn);
         match result {
-            Err(e) if !INTERRUPTED.load(Ordering::Relaxed) => log!("{}: {e:#}", conn.remote_address()),
+            Err(e) if !INTERRUPTED.load(Ordering::Relaxed) => log!("{}: {e:#}", peer_addr(&conn)),
             _ => {}
         }
         if !args.keep {
@@ -314,7 +327,7 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
 }
 
 async fn echo(conn: Connection) {
-    let peer = conn.remote_address();
+    let peer = peer_addr(&conn);
     let reason = loop {
         let (mut send, mut recv) = match conn.accept_bi().await {
             Ok(s) => s,
@@ -394,7 +407,7 @@ async fn client(args: &Args) -> Result<()> {
         }
     }
     let conn = conn.ok_or_else(|| anyhow!("could not connect to {host}:{port}"))?;
-    let addr = conn.remote_address();
+    let addr = peer_addr(&conn);
     vlog!(1, "connected to {addr} from {}", endpoint.local_addr()?);
     log_handshake(&conn);
 
@@ -484,7 +497,7 @@ fn log_handshake(conn: &Connection) {
         .unwrap_or_default();
     log!(
         "{}: connection id {}, alpn {}, sni {}",
-        conn.remote_address(),
+        peer_addr(conn),
         conn.stable_id(),
         alpn.as_deref().unwrap_or("-"),
         sni.as_deref().unwrap_or("-"),
@@ -493,10 +506,10 @@ fn log_handshake(conn: &Connection) {
 
 fn print_stats(conn: &Connection) {
     let s = conn.stats();
-    let peer = conn.remote_address();
+    let peer = peer_addr(conn);
     log!(
         "{}: rtt {:?}, cwnd {} B, sent {} B / {} dgrams, recv {} B / {} dgrams, lost {} pkts",
-        conn.remote_address(),
+        peer_addr(conn),
         s.path.rtt,
         s.path.cwnd,
         s.udp_tx.bytes,
@@ -543,6 +556,56 @@ fn frame_counts(s: &ConnectionStats, sent: bool) -> String {
     ];
     let parts: Vec<String> = counts.iter().filter(|(_, n)| *n > 0).map(|(name, n)| format!("{name} {n}")).collect();
     if parts.is_empty() { "-".into() } else { parts.join(", ") }
+}
+
+/// quinn writes the RTTs of `recovery:metrics_updated` qlog events in seconds,
+/// but qlog (and qvis) use milliseconds. This writer fixes them on the way to
+/// the file. Records are JSON-SEQ: RS (0x1e), JSON, LF.
+struct QlogRttFix {
+    file: std::fs::File,
+    buf: Vec<u8>,
+}
+
+impl Write for QlogRttFix {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        while let Some(end) = self.buf.iter().position(|&b| b == b'\n') {
+            let record: Vec<u8> = self.buf.drain(..=end).collect();
+            self.file.write_all(&rtt_to_millis(&record))?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn rtt_to_millis(record: &[u8]) -> Cow<'_, [u8]> {
+    let json = record.strip_prefix(b"\x1e").unwrap_or(record);
+    let Ok(mut event) = serde_json::from_slice::<serde_json::Value>(json) else {
+        return Cow::Borrowed(record);
+    };
+    if event["name"] != "recovery:metrics_updated" {
+        return Cow::Borrowed(record);
+    }
+    let Some(data) = event.get_mut("data").and_then(|d| d.as_object_mut()) else {
+        return Cow::Borrowed(record);
+    };
+    for key in ["min_rtt", "smoothed_rtt", "latest_rtt", "rtt_variance"] {
+        if let Some(v) = data.get_mut(key)
+            && let Some(secs) = v.as_f64()
+        {
+            // f32 seconds -> ms, rounded to µs to drop float noise.
+            *v = ((secs * 1e6).round() / 1e3).into();
+        }
+    }
+    let mut out = b"\x1e".to_vec();
+    if serde_json::to_writer(&mut out, &event).is_err() {
+        return Cow::Borrowed(record);
+    }
+    out.push(b'\n');
+    Cow::Owned(out)
 }
 
 /// Accepts any server certificate (still checks the handshake signatures).
