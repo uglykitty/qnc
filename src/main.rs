@@ -29,7 +29,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Parser};
 use quinn::{
     Connection, ConnectionError, ConnectionStats, Endpoint, QlogConfig, QlogStream, ReadError, RecvStream,
-    SendDatagramError, SendStream, TransportConfig,
+    SendDatagramError, SendStream, TransportConfig, VarInt,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
 use rustls::{
@@ -227,12 +227,16 @@ fn close_on_signal(endpoint: Endpoint) -> Result<()> {
     Ok(())
 }
 
-/// `keep_alive`: send a PING after 10 s without other ack-eliciting packets, so
-/// the connection outlives the idle timeout and NAT mappings stay open. Only
-/// the client does this; the server's ACKs to those PINGs keep its side alive.
-fn transport(qlog: Option<QlogStream>, keep_alive: bool) -> Arc<TransportConfig> {
+/// Only the client sends keep-alives: a PING after 10 s without other
+/// ack-eliciting packets, so the connection outlives the idle timeout and NAT
+/// mappings stay open; the server's ACKs to those PINGs keep its side alive.
+///
+/// Both sides announce a 60 s idle timeout (quinn's default is 30 s); the
+/// connection uses the smaller of the two announced values.
+fn transport(qlog: Option<QlogStream>, client: bool) -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
-    t.keep_alive_interval(keep_alive.then_some(Duration::from_secs(10)));
+    t.keep_alive_interval(client.then_some(Duration::from_secs(10)));
+    t.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
     t.qlog_stream(qlog);
     Arc::new(t)
 }
