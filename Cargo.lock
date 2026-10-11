@@ -669,6 +669,7 @@ dependencies = [
  "rustls",
  "rustyline",
  "serde_json",
+ "socket2",
  "tokio",
  "tracing-subscriber",
 ]

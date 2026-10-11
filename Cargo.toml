@@ -16,3 +16,4 @@ tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "fmt", "std", "tracing-log"] }
 rustyline = "17"
 libc = "0.2"
+socket2 = "0.6"

@@ -28,7 +28,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Parser};
 use quinn::{
-    Connection, ConnectionError, ConnectionStats, Endpoint, QlogConfig, QlogStream, ReadError, RecvStream,
+    Connection, ConnectionError, ConnectionStats, Endpoint, EndpointConfig, MtuDiscoveryConfig, QlogConfig, QlogStream, ReadError, RecvStream,
     SendDatagramError, SendStream, TransportConfig, VarInt,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
@@ -149,6 +149,19 @@ struct Args {
     #[arg(short, long, action = ArgAction::Count)]
     verbose: u8,
 
+    /// Disable MTU discovery: stay at --initial-mtu, send no probe PINGs
+    #[arg(long, conflicts_with = "mtu_upper")]
+    no_mtud: bool,
+
+    /// MTU discovery probes up to this UDP payload size; it is also the
+    /// largest we tell the peer we accept (max_udp_payload_size)
+    #[arg(long, value_name = "BYTES", default_value_t = 1452, value_parser = clap::value_parser!(u16).range(1200..=65527))]
+    mtu_upper: u16,
+
+    /// UDP payload size used from the handshake on, before MTU discovery
+    #[arg(long, value_name = "BYTES", default_value_t = 1200, value_parser = clap::value_parser!(u16).range(1200..=65527))]
+    initial_mtu: u16,
+
     /// Write a qlog trace of every connection into this directory
     #[arg(long, value_name = "DIR")]
     qlog: Option<PathBuf>,
@@ -236,12 +249,40 @@ fn close_on_signal(endpoint: Endpoint) -> Result<()> {
 ///
 /// Both sides announce a 60 s idle timeout (quinn's default is 30 s); the
 /// connection uses the smaller of the two announced values.
-fn transport(qlog: Option<QlogStream>, client: bool) -> Arc<TransportConfig> {
+///
+/// MTU discovery (DPLPMTUD) starts after the handshake: PING packets padded to
+/// sizes between --initial-mtu and --mtu-upper, binary search, each side
+/// probing its own sending direction.
+fn transport(args: &Args, qlog: Option<QlogStream>, client: bool) -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
+    t.initial_mtu(args.initial_mtu);
+    t.mtu_discovery_config((!args.no_mtud).then(|| {
+        let mut mtud = MtuDiscoveryConfig::default();
+        mtud.upper_bound(args.mtu_upper);
+        mtud
+    }));
     t.keep_alive_interval(client.then_some(Duration::from_secs(10)));
     t.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
     t.qlog_stream(qlog);
     Arc::new(t)
+}
+
+/// Like `Endpoint::server` / `Endpoint::client`, but announcing --mtu-upper (if
+/// above quinn's 1472) as our max_udp_payload_size, so a peer may probe that
+/// high. An IPv6 wildcard address gets a dual-stack socket.
+fn endpoint(args: &Args, server: Option<quinn::ServerConfig>, addr: SocketAddr) -> Result<Endpoint> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let mut config = EndpointConfig::default();
+    if u64::from(args.mtu_upper) > config.get_max_udp_payload_size() {
+        config.max_udp_payload_size(args.mtu_upper)?;
+    }
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() && addr.ip().is_unspecified() {
+        let _ = socket.set_only_v6(false);
+    }
+    socket.bind(&addr.into()).with_context(|| format!("binding udp {addr}"))?;
+    let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no async runtime"))?;
+    Ok(Endpoint::new(config, server, socket.into(), runtime)?)
 }
 
 /// `[::ffff:1.2.3.4]:5` -> `1.2.3.4:5`. A dual-stack socket reports IPv4 peers
@@ -312,8 +353,8 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
     tls.key_log = Arc::new(KeyLogFile::new());
 
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
-    config.transport_config(transport(None, false));
-    let endpoint = Endpoint::server(config.clone(), addr)?;
+    config.transport_config(transport(args, None, false));
+    let endpoint = endpoint(args, Some(config.clone()), addr)?;
     close_on_signal(endpoint.clone())?;
     vlog!(1, "listening on udp {}", endpoint.local_addr()?);
 
@@ -324,7 +365,7 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
         let connecting = match qlog(args, "server", peer, Some(&incoming.orig_dst_cid()))? {
             Some(stream) => {
                 let mut config = config.clone();
-                config.transport_config(transport(Some(stream), false));
+                config.transport_config(transport(args, Some(stream), false));
                 incoming.accept_with(Arc::new(config))
             }
             None => incoming.accept(),
@@ -459,7 +500,7 @@ async fn client(args: &Args) -> Result<()> {
     // Dual-stack socket, so one endpoint can try both IPv6 and IPv4 addresses.
     let any6: SocketAddr = "[::]:0".parse()?;
     let any4: SocketAddr = "0.0.0.0:0".parse()?;
-    let endpoint = Endpoint::client(any6).or_else(|_| Endpoint::client(any4))?;
+    let endpoint = endpoint(args, None, any6).or_else(|_| endpoint(args, None, any4))?;
     close_on_signal(endpoint.clone())?;
 
     // UDP gives no "connection refused", so try each address with a timeout
@@ -469,7 +510,7 @@ async fn client(args: &Args) -> Result<()> {
     for &addr in &addrs {
         vlog!(1, "trying {addr}");
         let mut config = config.clone();
-        config.transport_config(transport(qlog(args, "client", addr, None)?, true));
+        config.transport_config(transport(args, qlog(args, "client", addr, None)?, true));
         match tokio::time::timeout(Duration::from_secs(3), endpoint.connect_with(config, addr, sni)?).await {
             Ok(Ok(c)) => {
                 conn = Some(c);
@@ -666,9 +707,10 @@ fn print_stats(conn: &Connection) {
     let s = conn.stats();
     let peer = peer_addr(conn);
     log!(
-        "{}: rtt {:?}, cwnd {} B, sent {} B / {} dgrams, recv {} B / {} dgrams, lost {} pkts",
+        "{}: rtt {:?}, mtu {} B, cwnd {} B, sent {} B / {} dgrams, recv {} B / {} dgrams, lost {} pkts",
         peer_addr(conn),
         s.path.rtt,
+        s.path.current_mtu,
         s.path.cwnd,
         s.udp_tx.bytes,
         s.udp_tx.datagrams,
