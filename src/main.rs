@@ -20,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -48,6 +48,8 @@ use tracing_subscriber::{
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 static VERBOSE: AtomicU8 = AtomicU8::new(0);
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+/// Exit status after a signal: 128 + its number (130 SIGINT, 143 SIGTERM).
+static SIGNAL_EXIT: AtomicI32 = AtomicI32::new(0);
 
 /// Application error code sent in CONNECTION_CLOSE when we are interrupted.
 const CLOSE_INTERRUPTED: u32 = 1;
@@ -185,8 +187,8 @@ fn main() -> Result<()> {
     rt.shutdown_background();
     interactive::restore_terminal();
     if INTERRUPTED.load(Ordering::Relaxed) {
-        // Errors from connections we closed ourselves are expected; 130 = 128 + SIGINT.
-        std::process::exit(130);
+        // Errors from connections we closed ourselves are expected.
+        std::process::exit(SIGNAL_EXIT.load(Ordering::Relaxed));
     }
     if let Err(e) = result {
         log!("Error: {e:#}");
@@ -208,10 +210,11 @@ fn close_on_signal(endpoint: Endpoint) -> Result<()> {
     let mut int = signal(SignalKind::interrupt())?;
     let mut term = signal(SignalKind::terminate())?;
     tokio::spawn(async move {
-        let name = tokio::select! {
-            _ = int.recv() => "SIGINT",
-            _ = term.recv() => "SIGTERM",
+        let (name, number) = tokio::select! {
+            _ = int.recv() => ("SIGINT", libc::SIGINT),
+            _ = term.recv() => ("SIGTERM", libc::SIGTERM),
         };
+        SIGNAL_EXIT.store(128 + number, Ordering::Relaxed);
         INTERRUPTED.store(true, Ordering::Relaxed);
         vlog!(1, "{name}: closing {} connection(s), press Ctrl-C again to quit now", endpoint.open_connections());
         endpoint.close(CLOSE_INTERRUPTED.into(), b"interrupted");
@@ -222,7 +225,7 @@ fn close_on_signal(endpoint: Endpoint) -> Result<()> {
             _ = tokio::time::sleep(Duration::from_secs(3)) => log!("close timed out, exiting"),
         }
         interactive::restore_terminal();
-        std::process::exit(130);
+        std::process::exit(SIGNAL_EXIT.load(Ordering::Relaxed));
     });
     Ok(())
 }
