@@ -8,7 +8,11 @@
 use std::{
     collections::BTreeMap,
     io::{IsTerminal, Write},
-    sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc,
+    },
     time::Duration,
 };
 
@@ -113,6 +117,8 @@ struct Console {
 
 static CONSOLE: OnceLock<Console> = OnceLock::new();
 static SAVED_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
+/// The prompt is on screen, waiting for input.
+static READING: AtomicBool = AtomicBool::new(false);
 
 fn console() -> &'static Console {
     CONSOLE.get_or_init(|| {
@@ -145,7 +151,10 @@ fn console() -> &'static Console {
         std::thread::spawn(move || {
             loop {
                 let prompt = if tty { thread_prompt.lock().unwrap().clone() } else { String::new() };
-                match editor.readline(&prompt) {
+                READING.store(tty, Ordering::Relaxed);
+                let read = editor.readline(&prompt);
+                READING.store(false, Ordering::Relaxed);
+                match read {
                     Ok(line) => {
                         if tty && !line.trim().is_empty() {
                             let _ = editor.add_history_entry(line.as_str());
@@ -177,6 +186,13 @@ pub fn restore_terminal() {
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t);
         }
+    }
+    // Exiting under a prompt (e.g. the peer closed the connection): end its
+    // line, so the shell prompt does not follow it on the same line.
+    if READING.load(Ordering::Relaxed) {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(b"\n");
+        let _ = stdout.flush();
     }
 }
 
