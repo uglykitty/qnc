@@ -28,7 +28,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Parser};
 use quinn::{
-    Connection, ConnectionError, ConnectionStats, Endpoint, EndpointConfig, MtuDiscoveryConfig, QlogConfig, QlogStream, ReadError, RecvStream,
+    Connection, ConnectionError, ConnectionId, ConnectionIdGenerator, ConnectionStats, Endpoint, EndpointConfig, MtuDiscoveryConfig, QlogConfig, QlogStream, ReadError, RecvStream,
     SendDatagramError, SendStream, TransportConfig, VarInt,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
@@ -148,6 +148,12 @@ struct Args {
     /// and handshake details, -vvv quinn/rustls debug logs, -vvvv packet trace
     #[arg(short, long, action = ArgAction::Count)]
     verbose: u8,
+
+    /// Use zero-length connection IDs: the peer's packets carry no ID and are
+    /// matched by address, we send no NEW_CONNECTION_ID (no migration, no
+    /// stateless reset). With it on both sides no connection IDs are exchanged.
+    #[arg(long)]
+    zero_cid: bool,
 
     /// Disable MTU discovery: stay at --initial-mtu, send no probe PINGs
     #[arg(long, conflicts_with = "mtu_upper")]
@@ -269,12 +275,15 @@ fn transport(args: &Args, qlog: Option<QlogStream>, client: bool) -> Arc<Transpo
 
 /// Like `Endpoint::server` / `Endpoint::client`, but announcing --mtu-upper (if
 /// above quinn's 1472) as our max_udp_payload_size, so a peer may probe that
-/// high. An IPv6 wildcard address gets a dual-stack socket.
+/// high, and with --zero-cid. An IPv6 wildcard address gets a dual-stack socket.
 fn endpoint(args: &Args, server: Option<quinn::ServerConfig>, addr: SocketAddr) -> Result<Endpoint> {
     use socket2::{Domain, Protocol, Socket, Type};
     let mut config = EndpointConfig::default();
     if u64::from(args.mtu_upper) > config.get_max_udp_payload_size() {
         config.max_udp_payload_size(args.mtu_upper)?;
+    }
+    if args.zero_cid {
+        config.cid_generator(|| Box::new(ZeroLengthCid));
     }
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
     if addr.is_ipv6() && addr.ip().is_unspecified() {
@@ -283,6 +292,23 @@ fn endpoint(args: &Args, server: Option<quinn::ServerConfig>, addr: SocketAddr) 
     socket.bind(&addr.into()).with_context(|| format!("binding udp {addr}"))?;
     let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no async runtime"))?;
     Ok(Endpoint::new(config, server, socket.into(), runtime)?)
+}
+
+/// --zero-cid: every connection ID we issue is empty.
+struct ZeroLengthCid;
+
+impl ConnectionIdGenerator for ZeroLengthCid {
+    fn generate_cid(&mut self) -> ConnectionId {
+        ConnectionId::new(&[])
+    }
+
+    fn cid_len(&self) -> usize {
+        0
+    }
+
+    fn cid_lifetime(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// `[::ffff:1.2.3.4]:5` -> `1.2.3.4:5`. A dual-stack socket reports IPv4 peers
