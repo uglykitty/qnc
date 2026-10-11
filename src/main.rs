@@ -6,7 +6,8 @@
 //!
 //! Each connection carries one bidirectional stream: stdin is sent to the peer,
 //! what the peer sends is written to stdout. With -u, unreliable QUIC DATAGRAM
-//! frames (RFC 9221) are used instead, like `nc -u`.
+//! frames (RFC 9221) are used instead, like `nc -u`. With -i, an interactive
+//! console manages several streams on the connection (type /help).
 //!
 //! For learning/debugging the protocol:
 //!   -v .. -vvvv                 increasingly detailed logs (see --help)
@@ -72,6 +73,8 @@ macro_rules! vlog {
     };
 }
 
+mod interactive;
+
 /// Timestamps for quinn/rustls logs (-vvv), same format as `log!`.
 struct Uptime;
 
@@ -101,6 +104,11 @@ struct Args {
     /// both sides need it
     #[arg(short = 'u', long)]
     datagram: bool,
+
+    /// Interactive console: several streams, managed with /commands (/help);
+    /// Ctrl-C clears the line, Ctrl-D quits
+    #[arg(short, long, conflicts_with_all = ["datagram", "echo"])]
+    interactive: bool,
 
     /// With -u: after stdin EOF, keep receiving for SECS, then close
     #[arg(short = 'q', value_name = "SECS", default_value_t = 1.0, requires = "datagram")]
@@ -175,6 +183,7 @@ fn main() -> Result<()> {
     });
     // A pending blocking read on stdin would keep the runtime from shutting down.
     rt.shutdown_background();
+    interactive::restore_terminal();
     if INTERRUPTED.load(Ordering::Relaxed) {
         // Errors from connections we closed ourselves are expected; 130 = 128 + SIGINT.
         std::process::exit(130);
@@ -212,6 +221,7 @@ fn close_on_signal(endpoint: Endpoint) -> Result<()> {
             // Closing waits 3 PTOs at most; this only guards against a hang.
             _ = tokio::time::sleep(Duration::from_secs(3)) => log!("close timed out, exiting"),
         }
+        interactive::restore_terminal();
         std::process::exit(130);
     });
     Ok(())
@@ -324,8 +334,11 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
             continue;
         }
 
+        let mut stdin_ended = false;
         let result = if args.datagram {
             datagram_pipe(&conn, linger(args)?).await
+        } else if args.interactive {
+            interactive::run(&conn).await.map(|ended| stdin_ended = ended)
         } else {
             match conn.accept_bi().await {
                 Ok((send, recv)) => {
@@ -340,7 +353,7 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
             Err(e) if !INTERRUPTED.load(Ordering::Relaxed) => log!("{}: {e:#}", peer_addr(&conn)),
             _ => {}
         }
-        if !args.keep {
+        if !args.keep || stdin_ended {
             break;
         }
     }
@@ -464,6 +477,8 @@ async fn client(args: &Args) -> Result<()> {
 
     let result = if args.datagram {
         datagram_pipe(&conn, linger(args)?).await
+    } else if args.interactive {
+        interactive::run(&conn).await.map(|_| ())
     } else {
         let (send, recv) = conn.open_bi().await?;
         vlog!(2, "{addr}: opened {}", send.id());
