@@ -145,7 +145,8 @@ struct Args {
     qlog: Option<PathBuf>,
 
     /// Merge qlog files (e.g. the client and server trace of one connection)
-    /// into OUT, client first, as qvis's sequence diagram expects; then exit
+    /// into OUT, client first, as qvis's sequence diagram expects; then exit.
+    /// Also repairs files from older qnc versions; one input is fine
     #[arg(long, value_names = ["OUT", "SQLOG"], num_args = 2.., conflicts_with = "listen")]
     merge_qlog: Vec<PathBuf>,
 
@@ -844,6 +845,17 @@ fn read_sqlog(path: &Path) -> Result<Trace> {
         .or_else(|| events.first().and_then(|e| e.get("group_id")))
         .and_then(|g| g.as_str())
         .map(String::from);
+    // Files from before qnc used the ODCID switch group_id mid-trace (on the
+    // client, after the first Initial), and qvis splits a trace by group_id,
+    // showing only the Initial. The first event's group_id is the ODCID there.
+    let mut events = events;
+    if let Some(id) = &group_id {
+        for e in &mut events {
+            if let Some(g) = e.get_mut("group_id") {
+                *g = id.as_str().into();
+            }
+        }
+    }
     trace["events"] = events.into();
     Ok(Trace { path: path.to_owned(), role, group_id, trace })
 }
