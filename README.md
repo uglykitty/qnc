@@ -59,6 +59,7 @@ lines starting with `/` are commands:
 | `/stop [ID] [CODE]` | Ask the peer to stop sending (STOP_SENDING) |
 | `/kill [ID] [CODE]` | Abort both directions now (`/reset` + `/stop`) |
 | `/forget [ID]` | Remove an ended stream from `/list` (no ID: all ended ones); sends nothing |
+| `/migrate [PORT]` | Client: move the connection to a new local UDP port (random if not given), like switching networks |
 | `/quit` | Close the connection now |
 | `/help` | Show the command list |
 
@@ -67,7 +68,8 @@ To send a line starting with `/`, type `//`. Streams opened by the client are
 numbered 0, 4, 8, …, those opened by the server 1, 5, 9, ….
 
 Received data is printed per line, prefixed with the stream ID (`[4] hello`), and
-events such as a FIN or reset from the peer are shown as `* ...` lines. On a
+events such as a FIN or reset from the peer, or a change of the peer's address
+(the client migrating), are shown as `* ...` lines. On a
 terminal there is line editing and history, Tab completes command names and
 stream IDs, Ctrl-C clears the line, and Ctrl-D quits after sending FIN on every
 stream.

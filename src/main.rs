@@ -277,7 +277,6 @@ fn transport(args: &Args, qlog: Option<QlogStream>, client: bool) -> Arc<Transpo
 /// above quinn's 1472) as our max_udp_payload_size, so a peer may probe that
 /// high, and with --zero-cid. An IPv6 wildcard address gets a dual-stack socket.
 fn endpoint(args: &Args, server: Option<quinn::ServerConfig>, addr: SocketAddr) -> Result<Endpoint> {
-    use socket2::{Domain, Protocol, Socket, Type};
     let mut config = EndpointConfig::default();
     if u64::from(args.mtu_upper) > config.get_max_udp_payload_size() {
         config.max_udp_payload_size(args.mtu_upper)?;
@@ -285,13 +284,19 @@ fn endpoint(args: &Args, server: Option<quinn::ServerConfig>, addr: SocketAddr) 
     if args.zero_cid {
         config.cid_generator(|| Box::new(ZeroLengthCid));
     }
+    let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no async runtime"))?;
+    Ok(Endpoint::new(config, server, udp_socket(addr)?, runtime)?)
+}
+
+/// A UDP socket bound to `addr`; dual-stack for the IPv6 wildcard address.
+fn udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
     if addr.is_ipv6() && addr.ip().is_unspecified() {
         let _ = socket.set_only_v6(false);
     }
     socket.bind(&addr.into()).with_context(|| format!("binding udp {addr}"))?;
-    let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no async runtime"))?;
-    Ok(Endpoint::new(config, server, socket.into(), runtime)?)
+    Ok(socket.into())
 }
 
 /// --zero-cid: every connection ID we issue is empty.
@@ -429,7 +434,7 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
         let result = if args.datagram {
             datagram_pipe(&conn, linger(args)?).await
         } else if args.interactive {
-            interactive::run(&conn).await.map(|ended| stdin_ended = ended)
+            interactive::run(&conn, None).await.map(|ended| stdin_ended = ended)
         } else {
             match conn.accept_bi().await {
                 Ok((send, recv)) => {
@@ -569,7 +574,7 @@ async fn client(args: &Args) -> Result<()> {
     let result = if args.datagram {
         datagram_pipe(&conn, linger(args)?).await
     } else if args.interactive {
-        interactive::run(&conn).await.map(|_| ())
+        interactive::run(&conn, Some(&endpoint)).await.map(|_| ())
     } else {
         let (send, recv) = conn.open_bi().await?;
         vlog!(2, "{addr}: opened {}", send.id());

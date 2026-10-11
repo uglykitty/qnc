@@ -8,6 +8,7 @@
 use std::{
     collections::BTreeMap,
     io::{IsTerminal, Write},
+    net::SocketAddr,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -18,7 +19,7 @@ use std::{
 
 use anyhow::Result;
 use bytes::Bytes;
-use quinn::{Connection, ConnectionError, ReadError, RecvStream, SendStream, VarInt};
+use quinn::{Connection, ConnectionError, Endpoint, ReadError, RecvStream, SendStream, VarInt};
 use rustyline::{
     CompletionType, Config, Context, Editor, ExternalPrinter, Helper,
     completion::{Completer, Pair},
@@ -41,6 +42,8 @@ commands (any other line is sent to the current stream, \"//x\" sends \"/x\"):
   /kill [ID] [CODE]     abort both directions now (/reset + /stop)
   /forget [ID]          remove an ended stream from /list (no ID: all
                         ended ones); nothing is sent to the peer
+  /migrate [PORT]       client: move the connection to a new local UDP port
+                        (random if not given), like switching networks
   /quit                 close the connection now
 Tab completes command names and stream IDs.
 ID defaults to the current stream, CODE to 0. Stream IDs: 0, 4, 8, .. are
@@ -50,6 +53,7 @@ Ctrl-C clears the line, Ctrl-D quits after sending FIN on every stream.";
 /// Command names (for completion) and their usage.
 const COMMANDS: &[(&str, &str)] = &[
     ("open", "/open"),
+    ("migrate", "/migrate [PORT]"),
     ("list", "/list"),
     ("use", "/use ID"),
     ("close", "/close [ID]"),
@@ -262,6 +266,8 @@ struct Table {
 
 struct Session {
     conn: Connection,
+    /// Client only: its endpoint, for /migrate.
+    endpoint: Option<Endpoint>,
     table: Mutex<Table>,
 }
 
@@ -393,6 +399,20 @@ async fn accept_streams(s: Shared) {
     }
 }
 
+/// Reports when the peer's address changes: on a server, that is the client
+/// migrating (or a NAT rebinding), validated with PATH_CHALLENGE/PATH_RESPONSE.
+async fn watch_peer_address(conn: Connection) {
+    let mut addr = crate::peer_addr(&conn);
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = crate::peer_addr(&conn);
+        if now != addr {
+            info(format_args!("peer address changed: {addr} -> {now}"));
+            addr = now;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- commands
 
 /// Server: starts the console before the first client arrives.
@@ -419,14 +439,20 @@ pub async fn idle() {
 
 /// Runs the console on `conn` until it is closed (by either side) or stdin
 /// ends. Returns true if stdin ended, so a server should stop accepting.
-pub async fn run(conn: &Connection) -> Result<bool> {
-    let s: Shared = Arc::new(Session { conn: conn.clone(), table: Mutex::default() });
+/// `endpoint`: the client's endpoint (enables /migrate), None on a server.
+pub async fn run(conn: &Connection, endpoint: Option<&Endpoint>) -> Result<bool> {
+    let s: Shared = Arc::new(Session {
+        conn: conn.clone(),
+        endpoint: endpoint.cloned(),
+        table: Mutex::default(),
+    });
     let mut lines = console().lines.lock().await;
     STREAM_IDS.lock().unwrap().clear();
     set_prompt(None);
     info(format_args!("connected to {}; /help for commands, Ctrl-D to quit", crate::peer_addr(conn)));
     // No stream is opened up front: the connection starts empty, /open adds one.
     let accept = tokio::spawn(accept_streams(s.clone()));
+    let watch = tokio::spawn(watch_peer_address(conn.clone()));
 
     let result = loop {
         tokio::select! {
@@ -451,6 +477,7 @@ pub async fn run(conn: &Connection) -> Result<bool> {
         }
     };
     accept.abort();
+    watch.abort();
     set_prompt(None);
     result
 }
@@ -519,6 +546,7 @@ async fn command(s: &Shared, line: &str) -> bool {
             Ok(id) => forget(s, id),
             Err(e) => info(e),
         },
+        ("migrate", [] | [_]) => migrate(s, args.first()),
         ("quit", []) => return true,
         _ => match COMMANDS.iter().find(|c| c.0 == name) {
             Some((_, usage)) => info(format_args!("usage: {usage}")),
@@ -667,6 +695,31 @@ fn forget_ended(s: &Shared) {
     let ids: Vec<u64> = t.streams.iter().filter(|(_, st)| ended(st)).map(|(id, _)| *id).collect();
     remove(&mut t, &ids);
     info(format_args!("forgot {} ended stream(s)", ids.len()));
+}
+
+/// Client: switch the endpoint to a new UDP socket. quinn then sends from the
+/// new address with a fresh connection ID from the server (if it gave us a
+/// spare one), and the server validates the new path before using it.
+fn migrate(s: &Shared, port: Option<&&str>) {
+    let Some(endpoint) = &s.endpoint else {
+        info("only the client can migrate; QUIC servers keep their address");
+        return;
+    };
+    let port: u16 = match port.map(|p| p.parse()) {
+        None => 0,
+        Some(Ok(p)) => p,
+        Some(Err(_)) => return info(format_args!("bad port {:?}", port.unwrap())),
+    };
+    let result = endpoint.local_addr().map_err(anyhow::Error::from).and_then(|old| {
+        let socket = crate::udp_socket(SocketAddr::new(old.ip(), port))?;
+        let new = socket.local_addr()?;
+        endpoint.rebind(socket)?;
+        Ok((old, new))
+    });
+    match result {
+        Ok((old, new)) => info(format_args!("migrated from local {old} to {new}")),
+        Err(e) => info(format_args!("migrate failed: {e:#}")),
+    }
 }
 
 /// A known stream ID, or the current stream if `arg` is None.
