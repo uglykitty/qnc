@@ -17,3 +17,4 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["a
 rustyline = "17"
 libc = "0.2"
 socket2 = "0.6"
+rustls-native-certs = "0.8"

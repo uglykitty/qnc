@@ -32,6 +32,9 @@ qnc -l 0.0.0.0:4433 --save-cert cert.pem
 # Client trusting that certificate
 qnc --ca cert.pem localhost 4433
 
+# Client trusting the system CAs (the default without --ca)
+qnc example.com 443
+
 # Client that skips certificate verification
 qnc -k localhost 4433
 ```

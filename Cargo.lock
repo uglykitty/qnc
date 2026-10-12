@@ -667,6 +667,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
+ "rustls-native-certs",
  "rustyline",
  "serde_json",
  "socket2",

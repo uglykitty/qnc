@@ -2,6 +2,7 @@
 //!
 //!   qnc -l 0.0.0.0:4433 --save-cert cert.pem     # server, self-signed cert
 //!   qnc --ca cert.pem localhost 4433             # client, trust that cert
+//!   qnc example.com 443                          # client, trust the system CAs
 //!   qnc -k localhost 4433                        # client, skip verification
 //!
 //! Each connection carries one bidirectional stream: stdin is sent to the peer,
@@ -128,7 +129,7 @@ struct Args {
     #[arg(long, requires = "listen", conflicts_with = "cert")]
     save_cert: Option<PathBuf>,
 
-    /// Client: trust this CA / certificate (PEM)
+    /// Client: trust this CA / certificate (PEM) instead of the system CAs
     #[arg(long)]
     ca: Option<PathBuf>,
 
@@ -528,12 +529,18 @@ async fn client(args: &Args) -> Result<()> {
             .with_custom_certificate_verifier(Arc::new(NoVerify(provider())))
             .with_no_client_auth()
     } else {
-        let Some(ca) = &args.ca else {
-            bail!("need --ca FILE to verify the server, or -k to skip verification");
-        };
         let mut roots = rustls::RootCertStore::empty();
-        for cert in CertificateDer::pem_file_iter(ca).with_context(|| format!("reading {}", ca.display()))? {
-            roots.add(cert?)?;
+        if let Some(ca) = &args.ca {
+            for cert in CertificateDer::pem_file_iter(ca).with_context(|| format!("reading {}", ca.display()))? {
+                roots.add(cert?)?;
+            }
+        } else {
+            // The system trust store; a few unparsable entries are skipped.
+            let native = rustls_native_certs::load_native_certs();
+            roots.add_parsable_certificates(native.certs);
+            if roots.is_empty() {
+                bail!("no system CA certificates found ({:?}); use --ca FILE or -k", native.errors);
+            }
         }
         builder.with_root_certificates(roots).with_no_client_auth()
     };
