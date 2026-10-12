@@ -34,6 +34,8 @@ use tokio::{sync::mpsc, task::JoinHandle};
 const HELP: &str = "\
 commands (any other line is sent to the current stream, \"//x\" sends \"/x\"):
   /open                 open a new bidirectional stream and make it current
+  /open-uni             open a new unidirectional (send-only) stream and
+                        make it current
   /list, /ls            list streams (* = current)
   /use ID               make stream ID current
   /close [ID]           finish our sending side (FIN)
@@ -47,12 +49,14 @@ commands (any other line is sent to the current stream, \"//x\" sends \"/x\"):
   /quit                 close the connection now
 Tab completes command names and stream IDs.
 ID defaults to the current stream, CODE to 0. Stream IDs: 0, 4, 8, .. are
-opened by the client, 1, 5, 9, .. by the server.
+bidirectional streams opened by the client, 1, 5, 9, .. by the server;
+2, 6, 10, .. and 3, 7, 11, .. are their unidirectional ones.
 Ctrl-C clears the line, Ctrl-D quits after sending FIN on every stream.";
 
 /// Command names (for completion) and their usage.
 const COMMANDS: &[(&str, &str)] = &[
     ("open", "/open"),
+    ("open-uni", "/open-uni"),
     ("migrate", "/migrate [PORT]"),
     ("list", "/list"),
     ("use", "/use ID"),
@@ -247,6 +251,8 @@ enum SendCmd {
 struct Stream {
     /// Opened by us (otherwise by the peer).
     local: bool,
+    /// Unidirectional: only we send (local) or only the peer does.
+    uni: bool,
     send: String,
     recv: String,
     sent: u64,
@@ -286,32 +292,45 @@ impl Session {
     }
 }
 
-/// Start the reader and writer tasks of a new stream; it becomes current if
-/// there is none yet.
-fn register(s: &Shared, send: SendStream, recv: RecvStream, local: bool) -> u64 {
-    let id: u64 = send.id().into();
-    let (send_tx, send_rx) = mpsc::unbounded_channel();
-    let (stop_tx, stop_rx) = mpsc::unbounded_channel();
+/// Start the reader and writer tasks of a new stream (a unidirectional one
+/// has only one side); it becomes current if there is none yet and we can
+/// send on it.
+fn register(s: &Shared, send: Option<SendStream>, recv: Option<RecvStream>, local: bool) -> u64 {
+    let id: u64 = match (&send, &recv) {
+        (Some(send), _) => send.id().into(),
+        (None, Some(recv)) => recv.id().into(),
+        (None, None) => unreachable!("a stream has at least one side"),
+    };
+    let can_send = send.is_some();
     let mut t = s.table.lock().unwrap();
     t.streams.insert(
         id,
         Stream {
             local,
-            send: "open".into(),
-            recv: "open".into(),
+            uni: send.is_none() || recv.is_none(),
+            send: if send.is_some() { "open" } else { "-" }.into(),
+            recv: if recv.is_some() { "open" } else { "-" }.into(),
             sent: 0,
             recvd: 0,
-            send_tx: Some(send_tx),
-            stop_tx: Some(stop_tx),
+            send_tx: None,
+            stop_tx: None,
             writer: None,
         },
     );
     // The tasks wait for the lock we hold, so they see the entry.
-    let writer = tokio::spawn(writer(s.clone(), id, send, send_rx, local));
-    tokio::spawn(reader(s.clone(), id, recv, stop_rx));
-    t.streams.get_mut(&id).unwrap().writer = Some(writer);
+    let st = t.streams.get_mut(&id).unwrap();
+    if let Some(send) = send {
+        let (send_tx, send_rx) = mpsc::unbounded_channel();
+        st.send_tx = Some(send_tx);
+        st.writer = Some(tokio::spawn(writer(s.clone(), id, send, send_rx, local)));
+    }
+    if let Some(recv) = recv {
+        let (stop_tx, stop_rx) = mpsc::unbounded_channel();
+        st.stop_tx = Some(stop_tx);
+        tokio::spawn(reader(s.clone(), id, recv, stop_rx));
+    }
     STREAM_IDS.lock().unwrap().push(id);
-    if t.current.is_none() {
+    if t.current.is_none() && can_send {
         s.set_current(&mut t, id);
     }
     id
@@ -393,9 +412,19 @@ async fn reader(s: Shared, id: u64, mut recv: RecvStream, mut stop_rx: mpsc::Unb
 }
 
 async fn accept_streams(s: Shared) {
-    while let Ok((send, recv)) = s.conn.accept_bi().await {
-        let id = register(&s, send, recv, false);
-        info(format_args!("peer opened stream {id}"));
+    loop {
+        let (send, recv, kind) = tokio::select! {
+            r = s.conn.accept_bi() => match r {
+                Ok((send, recv)) => (Some(send), recv, "stream"),
+                Err(_) => return,
+            },
+            r = s.conn.accept_uni() => match r {
+                Ok(recv) => (None, recv, "unidirectional stream"),
+                Err(_) => return,
+            },
+        };
+        let id = register(&s, send, Some(recv), false);
+        info(format_args!("peer opened {kind} {id}"));
     }
 }
 
@@ -522,7 +551,8 @@ async fn command(s: &Shared, line: &str) -> bool {
     let args: Vec<&str> = words.collect();
     match (name, args.as_slice()) {
         ("help", _) => info(HELP),
-        ("open", []) => open(s).await,
+        ("open", []) => open(s, false).await,
+        ("open-uni", []) => open(s, true).await,
         ("list", []) => list(s),
         ("use", [id]) => match parse_id(s, Some(id)) {
             Ok(id) => {
@@ -562,19 +592,30 @@ fn send_line(s: &Shared, line: &str) {
         info("no stream yet, /open one");
         return;
     };
-    match t.streams.get(&id).and_then(|st| st.send_tx.as_ref()) {
+    let st = &t.streams[&id];
+    match &st.send_tx {
         Some(tx) => {
             let _ = tx.send(SendCmd::Data(Bytes::from(format!("{line}\n"))));
+        }
+        None if st.uni && !st.local => {
+            info(format_args!("stream {id} is the peer's unidirectional stream, we cannot send on it"))
         }
         None => info(format_args!("stream {id}: our sending side is closed, /open or /use another")),
     }
 }
 
-/// Opens a stream; if the peer's stream limit (MAX_STREAMS) is reached, keeps
-/// waiting in the background instead of blocking the console.
-async fn open(s: &Shared) {
+/// Opens a stream (send-only if `uni`); if the peer's stream limit
+/// (MAX_STREAMS) is reached, keeps waiting in the background instead of
+/// blocking the console.
+async fn open(s: &Shared, uni: bool) {
     let conn = s.conn.clone();
-    let mut opening = Box::pin(async move { conn.open_bi().await });
+    let mut opening = Box::pin(async move {
+        if uni {
+            conn.open_uni().await.map(|send| (send, None))
+        } else {
+            conn.open_bi().await.map(|(send, recv)| (send, Some(recv)))
+        }
+    });
     let opened = tokio::select! {
         r = &mut opening => r,
         _ = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -582,7 +623,7 @@ async fn open(s: &Shared) {
             let s = s.clone();
             tokio::spawn(async move {
                 if let Ok((send, recv)) = opening.await {
-                    let id = register(&s, send, recv, true);
+                    let id = register(&s, Some(send), recv, true);
                     let mut t = s.table.lock().unwrap();
                     s.set_current(&mut t, id);
                     info(format_args!("opened stream {id}"));
@@ -593,7 +634,7 @@ async fn open(s: &Shared) {
     };
     match opened {
         Ok((send, recv)) => {
-            let id = register(s, send, recv, true);
+            let id = register(s, Some(send), recv, true);
             let mut t = s.table.lock().unwrap();
             s.set_current(&mut t, id);
         }
@@ -607,12 +648,13 @@ fn list(s: &Shared) {
         info("no streams");
         return;
     }
-    let mut out = format!("{:>5}  {:<4} {:>8} {:>8}  {:<32} {}", "id", "by", "sent", "recvd", "send", "recv");
+    let mut out = format!("{:>5}  {:<4} {:<3} {:>8} {:>8}  {:<32} {}", "id", "by", "dir", "sent", "recvd", "send", "recv");
     for (id, st) in &t.streams {
         let mark = if t.current == Some(*id) { '*' } else { ' ' };
         let by = if st.local { "us" } else { "peer" };
+        let dir = if st.uni { "uni" } else { "bi" };
         out.push_str(&format!(
-            "\n  {mark}{id:>4}  {by:<4} {:>8} {:>8}  {:<32} {}",
+            "\n  {mark}{id:>4}  {by:<4} {dir:<3} {:>8} {:>8}  {:<32} {}",
             st.sent, st.recvd, st.send, st.recv
         ));
     }

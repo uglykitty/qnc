@@ -63,7 +63,8 @@ lines starting with `/` are commands:
 | Command | Effect |
 |---|---|
 | `/open` | Open a bidirectional stream and make it current |
-| `/list`, `/ls` | List streams: who opened them, bytes sent/received, the state of each direction (`*` = current) |
+| `/open-uni` | Open a unidirectional (send-only) stream and make it current |
+| `/list`, `/ls` | List streams: who opened them, bidirectional or unidirectional, bytes sent/received, the state of each direction (`*` = current) |
 | `/use ID` | Make stream ID current |
 | `/close [ID]` | Finish our sending side (FIN) |
 | `/reset [ID] [CODE]` | Abort our sending side (RESET_STREAM) |
@@ -75,8 +76,11 @@ lines starting with `/` are commands:
 | `/help` | Show the command list |
 
 `ID` defaults to the current stream and `CODE` (the application error code) to 0.
-To send a line starting with `/`, type `//`. Streams opened by the client are
-numbered 0, 4, 8, …, those opened by the server 1, 5, 9, ….
+To send a line starting with `/`, type `//`. Bidirectional streams opened by the
+client are numbered 0, 4, 8, …, those opened by the server 1, 5, 9, …;
+unidirectional ones 2, 6, 10, … (client) and 3, 7, 11, … (server).
+On a unidirectional stream only the side that opened it sends; the other side
+can only `/stop` it.
 
 Received data is printed per line, prefixed with the stream ID (`[4] hello`), and
 events such as a FIN or reset from the peer, or a change of the peer's address
