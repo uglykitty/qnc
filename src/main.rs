@@ -76,6 +76,7 @@ macro_rules! vlog {
     };
 }
 
+mod h3;
 mod interactive;
 
 /// Timestamps for quinn/rustls logs (-vvv), same format as `log!`.
@@ -141,7 +142,8 @@ struct Args {
     #[arg(long)]
     sni: Option<String>,
 
-    /// ALPN protocol, must match on both sides
+    /// ALPN protocol, must match on both sides; with "h3", received data is
+    /// decoded as HTTP/3 (frames, QPACK headers) before it is printed
     #[arg(long, default_value = "qnc")]
     alpn: String,
 
@@ -433,14 +435,14 @@ async fn server(args: &Args, addr: SocketAddr) -> Result<()> {
 
         let mut stdin_ended = false;
         let result = if args.datagram {
-            datagram_pipe(&conn, linger(args)?).await
+            datagram_pipe(&conn, linger(args)?, h3(args)).await
         } else if args.interactive {
-            interactive::run(&conn, None).await.map(|ended| stdin_ended = ended)
+            interactive::run(&conn, None, h3(args)).await.map(|ended| stdin_ended = ended)
         } else {
             match conn.accept_bi().await {
                 Ok((send, recv)) => {
                     vlog!(2, "{}: accepted {}", peer_addr(&conn), send.id());
-                    pipe(send, recv).await
+                    pipe(send, recv, h3(args)).await
                 }
                 Err(e) => Err(e.into()),
             }
@@ -579,13 +581,13 @@ async fn client(args: &Args) -> Result<()> {
     log_handshake(&conn);
 
     let result = if args.datagram {
-        datagram_pipe(&conn, linger(args)?).await
+        datagram_pipe(&conn, linger(args)?, h3(args)).await
     } else if args.interactive {
-        interactive::run(&conn, Some(&endpoint)).await.map(|_| ())
+        interactive::run(&conn, Some(&endpoint), h3(args)).await.map(|_| ())
     } else {
         let (send, recv) = conn.open_bi().await?;
         vlog!(2, "{addr}: opened {}", send.id());
-        pipe(send, recv).await
+        pipe(send, recv, h3(args)).await
     };
     finish(&conn);
     endpoint.wait_idle().await;
@@ -594,9 +596,15 @@ async fn client(args: &Args) -> Result<()> {
 
 // ---------------------------------------------------------------- shared
 
+/// --alpn h3: received data is shown decoded as HTTP/3.
+fn h3(args: &Args) -> bool {
+    args.alpn == "h3"
+}
+
 /// stdin -> send, recv -> stdout. Returns once the peer has finished its side;
-/// if our stdin hits EOF first, we half-close and keep reading.
-async fn pipe(mut send: SendStream, mut recv: RecvStream) -> Result<()> {
+/// if our stdin hits EOF first, we half-close and keep reading. With `h3`, what
+/// is received is decoded as HTTP/3 frames.
+async fn pipe(mut send: SendStream, mut recv: RecvStream, h3: bool) -> Result<()> {
     // Streams are only announced to the peer once a STREAM frame is sent, so
     // send an empty one right away; otherwise a server that talks first would
     // never see the stream.
@@ -616,7 +624,7 @@ async fn pipe(mut send: SendStream, mut recv: RecvStream) -> Result<()> {
     });
 
     let mut stdout = tokio::io::stdout();
-    let copied = tokio::io::copy(&mut recv, &mut stdout).await;
+    let copied = if h3 { copy_h3(&mut recv, &mut stdout).await } else { tokio::io::copy(&mut recv, &mut stdout).await };
     stdout.flush().await?;
     match copied {
         Ok(n) => vlog!(2, "{id}: received FIN after {n} bytes"),
@@ -648,6 +656,19 @@ async fn pipe(mut send: SendStream, mut recv: RecvStream) -> Result<()> {
     Ok(())
 }
 
+/// Like `tokio::io::copy`, but writes the stream decoded as HTTP/3.
+async fn copy_h3(recv: &mut RecvStream, stdout: &mut tokio::io::Stdout) -> std::io::Result<u64> {
+    let mut decoder = h3::Decoder::new(false);
+    let mut n = 0;
+    while let Some(chunk) = recv.read_chunk(64 * 1024, true).await? {
+        n += chunk.bytes.len() as u64;
+        stdout.write_all(&decoder.feed(&chunk.bytes)).await?;
+        stdout.flush().await?;
+    }
+    stdout.write_all(&decoder.end()).await?;
+    Ok(n)
+}
+
 fn linger(args: &Args) -> Result<Duration> {
     Duration::try_from_secs_f64(args.quit_after).map_err(|e| anyhow!("-q {}: {e}", args.quit_after))
 }
@@ -656,7 +677,8 @@ fn linger(args: &Args) -> Result<Duration> {
 /// larger than the peer accepts), every datagram received is written to stdout.
 /// Like UDP, datagrams may be lost or reordered and there is no EOF, so after
 /// our stdin ends we keep receiving for `linger`, then close the connection.
-async fn datagram_pipe(conn: &Connection, linger: Duration) -> Result<()> {
+/// With `h3`, received datagrams are decoded as HTTP Datagrams (RFC 9297).
+async fn datagram_pipe(conn: &Connection, linger: Duration, h3: bool) -> Result<()> {
     let peer = peer_addr(conn);
     let Some(max) = conn.max_datagram_size() else {
         bail!("{peer}: peer does not accept QUIC datagrams");
@@ -700,7 +722,11 @@ async fn datagram_pipe(conn: &Connection, linger: Duration) -> Result<()> {
                     count += 1;
                     bytes += data.len() as u64;
                     vlog!(2, "{peer}: received datagram of {} bytes", data.len());
-                    stdout.write_all(&data).await?;
+                    if h3 {
+                        stdout.write_all(&h3::datagram(&data)).await?;
+                    } else {
+                        stdout.write_all(&data).await?;
+                    }
                     stdout.flush().await?;
                 }
                 Err(ConnectionError::ApplicationClosed(c)) => {

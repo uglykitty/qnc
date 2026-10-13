@@ -2,7 +2,8 @@
 //!
 //! Lines typed on stdin are sent to the current stream; lines starting with
 //! `/` are commands to open, list, switch, finish, reset and stop streams.
-//! What the peer sends is printed per line, prefixed with the stream ID.
+//! What the peer sends is printed per line, prefixed with the stream ID; with
+//! --alpn h3 it is decoded as HTTP/3 first.
 //! On a terminal, Ctrl-C clears the line and Ctrl-D (on an empty line) quits.
 
 use std::{
@@ -216,6 +217,9 @@ fn info(msg: impl std::fmt::Display) {
 
 /// Data received on stream `id`, one output line per line of input.
 fn data(id: u64, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
     let text = String::from_utf8_lossy(bytes);
     let mut out = String::new();
     for line in text.split_inclusive('\n') {
@@ -274,6 +278,8 @@ struct Session {
     conn: Connection,
     /// Client only: its endpoint, for /migrate.
     endpoint: Option<Endpoint>,
+    /// --alpn h3: show received data decoded as HTTP/3.
+    h3: bool,
     table: Mutex<Table>,
 }
 
@@ -327,7 +333,8 @@ fn register(s: &Shared, send: Option<SendStream>, recv: Option<RecvStream>, loca
     if let Some(recv) = recv {
         let (stop_tx, stop_rx) = mpsc::unbounded_channel();
         st.stop_tx = Some(stop_tx);
-        tokio::spawn(reader(s.clone(), id, recv, stop_rx));
+        let decoder = s.h3.then(|| crate::h3::Decoder::new(st.uni));
+        tokio::spawn(reader(s.clone(), id, recv, stop_rx, decoder));
     }
     STREAM_IDS.lock().unwrap().push(id);
     if t.current.is_none() && can_send {
@@ -379,7 +386,8 @@ async fn writer(s: Shared, id: u64, mut send: SendStream, mut rx: mpsc::Unbounde
     });
 }
 
-async fn reader(s: Shared, id: u64, mut recv: RecvStream, mut stop_rx: mpsc::UnboundedReceiver<VarInt>) {
+/// `decoder`: --alpn h3, shows what is received decoded as HTTP/3.
+async fn reader(s: Shared, id: u64, mut recv: RecvStream, mut stop_rx: mpsc::UnboundedReceiver<VarInt>, mut decoder: Option<crate::h3::Decoder>) {
     let state = loop {
         tokio::select! {
             code = stop_rx.recv() => {
@@ -390,9 +398,15 @@ async fn reader(s: Shared, id: u64, mut recv: RecvStream, mut stop_rx: mpsc::Unb
             chunk = recv.read_chunk(64 * 1024, true) => match chunk {
                 Ok(Some(chunk)) => {
                     s.update(id, |st| st.recvd += chunk.bytes.len() as u64);
-                    data(id, &chunk.bytes);
+                    match &mut decoder {
+                        Some(d) => data(id, &d.feed(&chunk.bytes)),
+                        None => data(id, &chunk.bytes),
+                    }
                 }
                 Ok(None) => {
+                    if let Some(d) = &mut decoder {
+                        data(id, &d.end());
+                    }
                     info(format_args!("stream {id}: peer finished sending (FIN)"));
                     break "FIN received".into();
                 }
@@ -469,10 +483,12 @@ pub async fn idle() {
 /// Runs the console on `conn` until it is closed (by either side) or stdin
 /// ends. Returns true if stdin ended, so a server should stop accepting.
 /// `endpoint`: the client's endpoint (enables /migrate), None on a server.
-pub async fn run(conn: &Connection, endpoint: Option<&Endpoint>) -> Result<bool> {
+/// `h3`: show received data decoded as HTTP/3.
+pub async fn run(conn: &Connection, endpoint: Option<&Endpoint>, h3: bool) -> Result<bool> {
     let s: Shared = Arc::new(Session {
         conn: conn.clone(),
         endpoint: endpoint.cloned(),
+        h3,
         table: Mutex::default(),
     });
     let mut lines = console().lines.lock().await;

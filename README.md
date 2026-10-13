@@ -58,6 +58,30 @@ For a real certificate use `--cert chain.pem --key key.pem` on the server. On th
 client, `--sni` sets the TLS server name (default: HOST) and `--alpn` the ALPN
 protocol (default `qnc`, must match on both sides).
 
+## HTTP/3 (`--alpn h3`)
+
+With `--alpn h3`, received data is decoded as HTTP/3 before it is printed, in
+every mode: each frame is shown on a line of its own, `HEADERS` with its
+QPACK-decoded fields below it, `DATA` followed by its payload as is, `SETTINGS`,
+`GOAWAY` and the others with their values, and unknown or reserved ("grease")
+frames by type and length. In interactive mode the peer's unidirectional streams
+are labeled too (control stream, QPACK encoder/decoder stream, push stream); with
+`-u`, datagrams are decoded as HTTP Datagrams (RFC 9297). What we send is not
+changed: stdin still goes out as is.
+
+```sh
+# See what curl sends, decoded
+qnc -l 127.0.0.1:4433 --alpn h3 -i
+curl -k --http3-only https://127.0.0.1:4433/
+
+# Server's response to a GET written by hand (HEADERS frame, QPACK static table)
+python3 -c 'import sys; h=b"cloudflare-quic.com"; b=bytes([0,0,0xd1,0xd7,0xc1,0x50,len(h)])+h; sys.stdout.buffer.write(bytes([1,len(b)])+b)' |
+  qnc --alpn h3 cloudflare-quic.com 443
+```
+
+qnc sends no SETTINGS, so the peer must not use the QPACK dynamic table and
+every header block can be decoded on its own.
+
 ## Interactive mode (`-i`)
 
 The connection starts with no streams. Lines you type go to the current stream;
