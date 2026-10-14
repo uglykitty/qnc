@@ -131,7 +131,7 @@ impl Decoder {
                     if rest.is_empty() {
                         break;
                     }
-                    line(&mut out, format_args!("  {}", hex(rest)));
+                    line(&mut out, format_args!("  {}  {}", hex(rest), ascii(rest)));
                     pos = buf.len();
                 }
             }
@@ -301,6 +301,11 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
 }
 
+/// The bytes as printable ASCII, with "." for the rest, to go next to `hex`.
+fn ascii(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| if b == b' ' || b.is_ascii_graphic() { b as char } else { '.' }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +353,12 @@ mod tests {
         let mut d = Decoder::new(false);
         assert_eq!(text(d.feed(&[0x00, 0x05, b'h', b'i'])), "DATA, 5 bytes\nhi");
         assert_eq!(text(d.end()), "\n(stream ended 3 bytes before the end of the frame)\n");
+    }
+
+    #[test]
+    fn unknown_stream() {
+        // A reserved stream type (0x21) followed by text and a non-printable byte.
+        assert_eq!(text(Decoder::new(true).feed(&[0x21, b'h', b'i', 0x00])), "stream type 0x21 (reserved)\n  68 69 00  hi.\n");
     }
 
     #[test]
